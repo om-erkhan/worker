@@ -1,0 +1,940 @@
+const fs = require('fs');
+const path = require('path');
+const pino = require('pino');
+const QRCode = require('qrcode');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  isJidBroadcast,
+  jidNormalizedUser,
+  Browsers
+} = require('@whiskeysockets/baileys');
+
+const config = require('./config');
+const backend = require('./backendClient');
+const { isCommonJunkMessage } = require('./messageFilter');
+
+const logger = pino({ level: config.logLevel });
+const HISTORY_BATCH = 50;
+const HISTORY_MAX_ROUNDS = Math.ceil((config.historyLimit || 500) / HISTORY_BATCH);
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function toCUs(jid) {
+  if (!jid) return '';
+  const normalized = jidNormalizedUser(jid) || jid;
+  return String(normalized);
+}
+
+function chatNameFrom(sock, jid, fallbackName) {
+  if (fallbackName) return fallbackName;
+  try {
+    const meta = sock.contacts?.[jid] || sock.store?.contacts?.[jid];
+    if (meta?.name || meta?.notify || meta?.verifiedName) {
+      return meta.name || meta.notify || meta.verifiedName;
+    }
+  } catch (_) {}
+  return String(jid).split('@')[0];
+}
+
+function extractText(msg) {
+  if (!msg?.message || msg.message.protocolMessage) return '';
+  return (
+    msg.message.conversation ||
+    msg.message.extendedTextMessage?.text ||
+    msg.message.imageMessage?.caption ||
+    msg.message.videoMessage?.caption ||
+    msg.message.documentMessage?.caption ||
+    msg.message.buttonsMessage?.contentText ||
+    msg.message.listMessage?.description ||
+    ''
+  );
+}
+
+class SessionManager {
+  constructor() {
+    ensureDir(config.sessionsDir);
+    /** @type {Map<number, any>} */
+    this.sessions = new Map();
+  }
+
+  list() {
+    return Array.from(this.sessions.entries()).map(([userId, s]) => ({
+      userId,
+      status: s.status,
+      lastQrAt: s.lastQrAt || null,
+      connectedAt: s.connectedAt || null,
+      statusSince: s.statusSince || null,
+      monitoredCount: s.monitoredJids?.size || 0,
+      historySynced: s.historySyncedJids?.size || 0,
+      error: s.error || null
+    }));
+  }
+
+  get(userId) {
+    return this.sessions.get(Number(userId)) || null;
+  }
+
+  _setStatus(state, status) {
+    if (!state) return;
+    if (state.status !== status) {
+      state.status = status;
+      state.statusSince = Date.now();
+    } else if (!state.statusSince) {
+      state.statusSince = Date.now();
+    }
+  }
+
+  /**
+   * True when a never-linked / waiting session is stuck and will not show a usable QR
+   * (stale QR, endless reconnect, or orphaned reconnect without timer).
+   */
+  needsFreshQr(userId) {
+    const s = this.sessions.get(Number(userId));
+    if (!s) return false;
+    if (s.connectedAt || s.status === 'connected') return false;
+    if (s.startingLock) return false;
+
+    const now = Date.now();
+    const lastQrMs = s.lastQrAt ? Date.parse(s.lastQrAt) : 0;
+    const since = s.statusSince || lastQrMs || 0;
+    const staleQr = config.staleQrMs || 90000;
+    const stuckReconnect = config.stuckReconnectMs || 60000;
+    const hasCreds = this.hasAuthCreds(userId);
+
+    // Linked-device restore path: do not wipe auth on short reconnects
+    if (hasCreds) {
+      if (s.status === 'reconnecting') {
+        if (!s.reconnectTimer && !s.sock) return true; // orphaned
+        if (since && now - since > stuckReconnect * 3) return true; // hung restore
+      }
+      if (s.status === 'error') {
+        const failedAt = s.errorAt || since || 0;
+        return !failedAt || now - failedAt >= 30000;
+      }
+      return false;
+    }
+
+    if (s.status === 'reconnecting') {
+      if (!lastQrMs) return true;
+      if (now - lastQrMs > staleQr) return true;
+      if (since && now - since > stuckReconnect) return true;
+      if (!s.reconnectTimer && !s.sock) return true;
+      return false;
+    }
+
+    if (s.status === 'qr') {
+      if (!lastQrMs || now - lastQrMs > staleQr) return true;
+      return false;
+    }
+
+    if (s.status === 'error' || s.status === 'disconnected') {
+      const failedAt = s.errorAt || since || 0;
+      return !failedAt || now - failedAt >= 30000;
+    }
+
+    return false;
+  }
+
+  /**
+   * Hard reset for waiting users: stop socket, wipe auth, start clean QR.
+   * For linked users with creds, prefer restartWithoutWipe().
+   */
+  async forceFreshQr(userId, { wipeAuth = true } = {}) {
+    const id = Number(userId);
+    if (!id) throw new Error('userId is required');
+    logger.warn({ userId: id, wipeAuth }, 'Forcing session restart for QR/reconnect');
+    await this.stop(id, { logout: false });
+    if (wipeAuth) {
+      this.clearAuth(id);
+      try {
+        await backend.resetClaimToWaiting(id);
+      } catch (_) {}
+    }
+    return this.start(id);
+  }
+
+  async start(userId) {
+    const id = Number(userId);
+    if (!id) throw new Error('userId is required');
+
+    const existing = this.sessions.get(id);
+    if (existing && ['starting', 'qr', 'connected', 'reconnecting'].includes(existing.status)) {
+      return this.getPublic(id);
+    }
+    // Guard overlapping start() calls (poll interval can overlap)
+    if (existing?.startingLock) {
+      return this.getPublic(id);
+    }
+
+    const authDir = path.join(config.sessionsDir, `user_${id}`);
+    ensureDir(authDir);
+
+    const state = {
+      userId: id,
+      status: 'starting',
+      statusSince: Date.now(),
+      startingLock: true,
+      sock: null,
+      authDir,
+      lastQrAt: null,
+      connectedAt: null,
+      monitoredJids: new Set(),
+      monitoredMeta: new Map(), // jid -> { name }
+      seenMsgKeys: new Set(),
+      historySyncedJids: new Set(),
+      historySyncing: new Set(),
+      msgCache: new Map(), // jid -> WAMessage[]
+      historyWaiters: new Set(),
+      error: null,
+      errorAt: null,
+      stopping: false,
+      reconnectAttempts: 0,
+      reconnectTimer: null,
+      bootGeneration: 0
+    };
+    this.sessions.set(id, state);
+
+    try {
+      await this._bootSocket(state);
+      state.startingLock = false;
+    } catch (err) {
+      state.startingLock = false;
+      state.status = 'error';
+      state.error = err.message;
+      state.errorAt = Date.now();
+      logger.error({ userId: id, err }, 'Failed to start session');
+      throw err;
+    }
+
+    return this.getPublic(id);
+  }
+
+  getPublic(userId) {
+    const s = this.sessions.get(Number(userId));
+    if (!s) return null;
+    return {
+      userId: s.userId,
+      status: s.status,
+      lastQrAt: s.lastQrAt,
+      connectedAt: s.connectedAt,
+      statusSince: s.statusSince || null,
+      monitoredCount: s.monitoredJids.size,
+      historySynced: s.historySyncedJids.size,
+      error: s.error
+    };
+  }
+
+  async stop(userId, { logout = false } = {}) {
+    const id = Number(userId);
+    const state = this.sessions.get(id);
+    if (!state) return { userId: id, status: 'stopped' };
+
+    state.stopping = true;
+    if (state.reconnectTimer) {
+      clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = null;
+    }
+    try {
+      if (logout) {
+        try {
+          await backend.pauseScraping(id);
+        } catch (pauseErr) {
+          logger.warn({ userId: id, err: pauseErr.message }, 'Failed stamping scrape pause on logout');
+        }
+      }
+      if (logout && state.sock?.logout) await state.sock.logout();
+      else if (state.sock?.end) state.sock.end(undefined);
+    } catch (_) {}
+
+    if (state.monitoredTimer) clearInterval(state.monitoredTimer);
+    this.sessions.delete(id);
+    return { userId: id, status: 'stopped' };
+  }
+
+  hasAuthCreds(userId) {
+    const authDir = path.join(config.sessionsDir, `user_${Number(userId)}`);
+    try {
+      return fs.existsSync(path.join(authDir, 'creds.json'));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  clearAuth(userId) {
+    const authDir = path.join(config.sessionsDir, `user_${Number(userId)}`);
+    try {
+      if (fs.existsSync(authDir)) {
+        fs.rmSync(authDir, { recursive: true, force: true });
+      }
+    } catch (err) {
+      logger.warn({ userId, err: err.message }, 'Failed clearing auth dir');
+    }
+  }
+
+  async restoreAll() {
+    const entries = fs.readdirSync(config.sessionsDir, { withFileTypes: true });
+    for (const ent of entries) {
+      if (!ent.isDirectory()) continue;
+      const m = ent.name.match(/^user_(\d+)$/);
+      if (!m) continue;
+      const userId = parseInt(m[1], 10);
+      // Skip empty folders — they only create reconnect storms with no QR
+      if (!this.hasAuthCreds(userId)) {
+        logger.info({ userId }, 'Skipping empty session folder (no creds.json)');
+        continue;
+      }
+      logger.info({ userId }, 'Restoring saved WhatsApp session');
+      try {
+        await this.start(userId);
+      } catch (err) {
+        logger.error({ userId, err: err.message }, 'Restore failed');
+      }
+    }
+  }
+
+  _cacheMessages(state, messages) {
+    for (const msg of messages || []) {
+      const jid = toCUs(msg?.key?.remoteJid);
+      if (!jid || !msg?.key?.id) continue;
+      if (!state.msgCache.has(jid)) state.msgCache.set(jid, []);
+      const arr = state.msgCache.get(jid);
+      if (arr.some((m) => m.key?.id === msg.key.id)) continue;
+      arr.push(msg);
+      // keep newest/oldest usable set bounded
+      if (arr.length > (config.historyLimit || 500) + 100) {
+        arr.sort(
+          (a, b) => Number(a.messageTimestamp || 0) - Number(b.messageTimestamp || 0)
+        );
+        state.msgCache.set(jid, arr.slice(-(config.historyLimit || 500)));
+      }
+    }
+  }
+
+  _oldestCached(state, jid) {
+    const arr = state.msgCache.get(jid) || [];
+    if (!arr.length) return null;
+    return arr.reduce((oldest, msg) => {
+      if (!oldest) return msg;
+      return Number(msg.messageTimestamp || 0) < Number(oldest.messageTimestamp || 0)
+        ? msg
+        : oldest;
+    }, null);
+  }
+
+  _notifyHistoryWaiters(state) {
+    for (const resolve of state.historyWaiters) {
+      try {
+        resolve();
+      } catch (_) {}
+    }
+    state.historyWaiters.clear();
+  }
+
+  waitForHistoryBatch(state, timeoutMs = 8000) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        state.historyWaiters.delete(wrapped);
+        resolve(false);
+      }, timeoutMs);
+      const wrapped = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      state.historyWaiters.add(wrapped);
+    });
+  }
+
+  async _bootSocket(state) {
+    const authDir = state.authDir || path.join(config.sessionsDir, `user_${state.userId}`);
+    state.authDir = authDir;
+    ensureDir(authDir);
+
+    // Kill previous socket so we never stack multiple WA connections
+    const prev = state.sock;
+    state.sock = null;
+    if (prev) {
+      try {
+        prev.ev.removeAllListeners('connection.update');
+        prev.ev.removeAllListeners('creds.update');
+        // Prefer ws close without Boom("Connection Terminated") noise when possible
+        if (prev.ws?.close) prev.ws.close();
+        else prev.end(undefined);
+      } catch (_) {}
+      await sleep(300);
+    }
+
+    const bootGeneration = (state.bootGeneration || 0) + 1;
+    state.bootGeneration = bootGeneration;
+
+    const { state: authState, saveCreds } = await useMultiFileAuthState(authDir);
+    const { version } = await fetchLatestBaileysVersion();
+
+    // Unique device name per portal user so the same phone can link
+    // multiple portal accounts as separate WhatsApp "Linked devices".
+    // Identical names (e.g. all "Chrome") cause WA to replace the previous device.
+    const deviceName = `PortalUser${state.userId}`;
+    const sock = makeWASocket({
+      version,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+      browser: Browsers.ubuntu(deviceName),
+      syncFullHistory: true,
+      auth: {
+        creds: authState.creds,
+        keys: makeCacheableSignalKeyStore(authState.keys, pino({ level: 'silent' }))
+      },
+      generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: false,
+      connectTimeoutMs: 60000,
+      getMessage: async (key) => {
+        const jid = toCUs(key.remoteJid);
+        const arr = state.msgCache.get(jid) || [];
+        const found = arr.find((m) => m.key?.id === key.id);
+        return found?.message || undefined;
+      }
+    });
+
+    state.sock = sock;
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+      // Ignore events from an older socket after reconnect
+      if (state.bootGeneration !== bootGeneration || state.sock !== sock) return;
+
+      const { connection, lastDisconnect, qr } = update;
+      if (qr || connection) {
+        logger.info(
+          {
+            userId: state.userId,
+            connection: connection || null,
+            hasQr: !!qr,
+            code: lastDisconnect?.error?.output?.statusCode || null
+          },
+          'connection.update'
+        );
+      }
+
+      if (qr) {
+        this._setStatus(state, 'qr');
+        state.reconnectAttempts = 0;
+        state.lastQrAt = new Date().toISOString();
+        try {
+          await backend.postQr(state.userId, qr);
+          state.lastQrDataUrl = await QRCode.toDataURL(qr);
+          logger.info({ userId: state.userId }, 'QR posted to backend');
+        } catch (err) {
+          logger.error({ userId: state.userId, err: err.message }, 'Failed posting QR');
+        }
+      }
+
+      if (connection === 'open') {
+        this._setStatus(state, 'connected');
+        state.reconnectAttempts = 0;
+        state.connectedAt = new Date().toISOString();
+        state.error = null;
+        const waJid = toCUs(sock.user?.id || sock.user?.lid || '');
+        state.waJid = waJid || null;
+
+        // Same WhatsApp number may already be linked on other portal users — keep all.
+        const peers = [];
+        for (const [otherId, other] of this.sessions.entries()) {
+          if (otherId === state.userId) continue;
+          if (!other?.waJid || !waJid) continue;
+          const a = String(other.waJid).split('@')[0].split(':')[0];
+          const b = String(waJid).split('@')[0].split(':')[0];
+          if (a && b && (a === b || a.endsWith(b) || b.endsWith(a))) {
+            peers.push(otherId);
+          }
+        }
+        logger.info(
+          { userId: state.userId, waJid: state.waJid, sameWaPeers: peers },
+          'WhatsApp connected (multi-user same number allowed)'
+        );
+
+        try {
+          const statusRes = await backend.postQrStatus(
+            state.userId,
+            'WhatsApp linked / QR disappeared',
+            state.waJid
+          );
+          const postedFor = Number(
+            statusRes?.data?.userId || statusRes?.data?.user_id || state.userId
+          );
+          if (postedFor && postedFor !== state.userId) {
+            logger.error(
+              { userId: state.userId, postedFor, waJid: state.waJid },
+              'Backend attributed link to a different userId — refusing to continue as wrong tenant'
+            );
+          }
+        } catch (err) {
+          // Permanently bound to another number — drop this wrong session only
+          if (err.status === 409 || err.body?.code === 'WHATSAPP_BIND_MISMATCH') {
+            logger.warn(
+              { userId: state.userId, waJid: state.waJid, body: err.body },
+              'WhatsApp number not allowed for this portal user — logging out'
+            );
+            try {
+              await sock.logout();
+            } catch (_) {}
+            this.clearAuth(state.userId);
+            try {
+              await backend.resetClaimToWaiting(state.userId);
+            } catch (_) {}
+            state.status = 'error';
+            state.error = 'WHATSAPP_BIND_MISMATCH';
+            this.sessions.delete(state.userId);
+            return;
+          }
+          logger.error({ userId: state.userId, err: err.message }, 'Failed posting QR status');
+        }
+        await this._syncChats(state);
+        await this._refreshMonitored(state);
+        if (state.monitoredTimer) clearInterval(state.monitoredTimer);
+        state.monitoredTimer = setInterval(() => {
+          this._refreshMonitored(state).catch(() => {});
+        }, config.monitoredPollMs);
+      }
+
+      if (connection === 'close') {
+        const err = lastDisconnect?.error;
+        const code = err?.output?.statusCode;
+        const errMsg = err?.message || String(err || '');
+        const loggedOut = code === DisconnectReason.loggedOut;
+        const shouldReconnect = !loggedOut && !state.stopping;
+
+        if (state.monitoredTimer) {
+          clearInterval(state.monitoredTimer);
+          state.monitoredTimer = null;
+        }
+
+        logger.warn(
+          { userId: state.userId, code, errMsg, attempts: state.reconnectAttempts },
+          'WhatsApp disconnected'
+        );
+
+        if (!shouldReconnect) {
+          // Logged out / invalid session: stamp scrape pause, wipe auth for fresh QR
+          logger.warn({ userId: state.userId, code }, 'Session logged out — clearing auth for fresh QR');
+          try {
+            await backend.pauseScraping(state.userId);
+          } catch (pauseErr) {
+            logger.warn(
+              { userId: state.userId, err: pauseErr.message },
+              'Failed stamping scrape pause on session logout'
+            );
+          }
+          this.clearAuth(state.userId);
+          try {
+            await backend.resetClaimToWaiting(state.userId);
+          } catch (resetErr) {
+            logger.warn(
+              { userId: state.userId, err: resetErr.message },
+              'Failed resetting claim to waiting'
+            );
+          }
+          this._setStatus(state, 'disconnected');
+          this.sessions.delete(state.userId);
+          return;
+        }
+
+        state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
+
+        // QR expired / never linked: clear half-auth and refresh QR quickly
+        const neverLinked = !state.connectedAt;
+        const qrExpired =
+          code === 408 ||
+          /QR refs attempts ended/i.test(errMsg) ||
+          code === DisconnectReason.timedOut;
+
+        if (neverLinked && (qrExpired || state.reconnectAttempts >= 2)) {
+          logger.warn(
+            { userId: state.userId, code, attempts: state.reconnectAttempts },
+            'Never-linked session disconnect — clearing auth for fresh QR'
+          );
+          this.clearAuth(state.userId);
+          ensureDir(authDir);
+          state.reconnectAttempts = 0;
+        }
+
+        // After repeated closes with no QR/creds, wipe auth and cool down
+        if (state.reconnectAttempts >= 5 && !this.hasAuthCreds(state.userId)) {
+          logger.error(
+            { userId: state.userId, attempts: state.reconnectAttempts },
+            'No QR/creds after repeated disconnects — pausing session (check AWS IP / WhatsApp block)'
+          );
+          this._setStatus(state, 'error');
+          state.error = 'WhatsApp connection failed before QR. Often blocked datacenter IP.';
+          state.errorAt = Date.now();
+          try {
+            sock.ev.removeAllListeners();
+            sock.end(undefined);
+          } catch (_) {}
+          return;
+        }
+
+        // Bad / half-written session: clear and retry for a fresh QR
+        if (
+          state.reconnectAttempts >= 3 &&
+          (code === DisconnectReason.badSession ||
+            code === DisconnectReason.connectionClosed ||
+            code === DisconnectReason.multideviceMismatch)
+        ) {
+          if (!state.connectedAt) {
+            logger.warn({ userId: state.userId }, 'Clearing broken auth for fresh QR');
+            this.clearAuth(state.userId);
+            ensureDir(authDir);
+          }
+        }
+
+        // Fast retry for QR refresh; slower only after a prior successful link
+        const delay = neverLinked
+          ? Math.min(5000, 1000 + state.reconnectAttempts * 500)
+          : Math.min(30000, 2000 * state.reconnectAttempts);
+        this._setStatus(state, 'reconnecting');
+        if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = setTimeout(() => {
+          state.reconnectTimer = null;
+          if (!state.stopping && this.sessions.get(state.userId) === state) {
+            this._bootSocket(state).catch((bootErr) => {
+              this._setStatus(state, 'error');
+              state.error = bootErr.message;
+              state.errorAt = Date.now();
+            });
+          }
+        }, delay);
+      }
+    });
+
+    // Initial + on-demand history batches land here
+    sock.ev.on('messaging-history.set', async (payload) => {
+      try {
+        const { chats, messages } = payload || {};
+        if (Array.isArray(chats) && chats.length) {
+          await this._uploadChats(state, chats);
+        }
+        if (Array.isArray(messages) && messages.length) {
+          this._cacheMessages(state, messages);
+          // Post any monitored history immediately
+          await this._handleMessages(state, messages, { isHistory: true });
+          logger.info(
+            { userId: state.userId, count: messages.length },
+            'History batch received'
+          );
+        }
+        this._notifyHistoryWaiters(state);
+      } catch (err) {
+        logger.error({ userId: state.userId, err: err.message }, 'messaging-history.set failed');
+        this._notifyHistoryWaiters(state);
+      }
+    });
+
+    sock.ev.on('chats.upsert', async (chats) => {
+      try {
+        await this._uploadChats(state, chats);
+      } catch (err) {
+        logger.error({ userId: state.userId, err: err.message }, 'chats.upsert upload failed');
+      }
+    });
+
+    sock.ev.on('chats.update', async (chats) => {
+      try {
+        await this._uploadChats(state, chats);
+      } catch (_) {}
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (!messages?.length) return;
+      try {
+        this._cacheMessages(state, messages);
+        await this._handleMessages(state, messages, { type });
+      } catch (err) {
+        logger.error({ userId: state.userId, err: err.message }, 'messages.upsert failed');
+      }
+    });
+  }
+
+  async _uploadChats(state, chats) {
+    const contacts = [];
+    for (const chat of chats || []) {
+      const jid = toCUs(chat.id || chat.jid);
+      if (!jid || isJidBroadcast(jid) || jid.endsWith('@newsletter')) continue;
+      const name =
+        chat.name ||
+        chat.subject ||
+        chatNameFrom(state.sock, jid) ||
+        jid.split('@')[0];
+      contacts.push({ id: jid, name, avatar: null });
+    }
+    if (!contacts.length) return;
+    await backend.postContacts(state.userId, contacts);
+    logger.info({ userId: state.userId, count: contacts.length }, 'Uploaded chatrooms');
+  }
+
+  async _syncChats(state) {
+    try {
+      const storeChats = state.sock?.store?.chats?.all?.() || [];
+      if (storeChats.length) await this._uploadChats(state, storeChats);
+    } catch (_) {}
+  }
+
+  async _refreshMonitored(state) {
+    const monitored = await backend.getMonitored(state.userId);
+    const next = new Set();
+    state.monitoredMeta = state.monitoredMeta || new Map();
+
+    for (const c of monitored || []) {
+      const jid = toCUs(c.jid || c.id);
+      if (!jid) continue;
+      next.add(jid);
+      const monitoredAtMs = c.monitored_at
+        ? Date.parse(c.monitored_at)
+        : c.created_at
+          ? Date.parse(c.created_at)
+          : null;
+      const lastScrapedAtMs = c.last_scraped_at ? Date.parse(c.last_scraped_at) : null;
+      state.monitoredMeta.set(jid, {
+        name: c.name || chatNameFrom(state.sock, jid),
+        monitoredAtMs: Number.isFinite(monitoredAtMs) ? monitoredAtMs : Date.now(),
+        lastScrapedAtMs: Number.isFinite(lastScrapedAtMs) ? lastScrapedAtMs : null
+      });
+    }
+
+    // Newly monitored → forward-only (no historical backlog)
+    const newlyMonitored = [];
+    for (const jid of next) {
+      if (!state.monitoredJids.has(jid) || !state.historySyncedJids.has(jid)) {
+        if (!state.historySyncedJids.has(jid) && !state.historySyncing.has(jid)) {
+          newlyMonitored.push(jid);
+        }
+      }
+    }
+
+    state.monitoredJids = next;
+    logger.info(
+      { userId: state.userId, count: next.size, forwardOnly: newlyMonitored.length },
+      'Monitored chats refreshed'
+    );
+
+    for (const jid of newlyMonitored) {
+      state.historySyncedJids.add(jid);
+      logger.info(
+        { userId: state.userId, jid, chatName: state.monitoredMeta.get(jid)?.name },
+        'Chat monitored — forward-only scrape from monitor date'
+      );
+    }
+  }
+
+  /**
+   * Pull older messages for a newly monitored chat and post them to backend.
+   */
+  async _syncFullHistory(state, jid, chatName) {
+    if (!state.sock || state.historySyncing.has(jid) || state.historySyncedJids.has(jid)) return;
+    state.historySyncing.add(jid);
+
+    logger.info({ userId: state.userId, jid, chatName }, 'Starting full history sync');
+
+    try {
+      // 1) Flush anything already cached for this chat
+      const cached = state.msgCache.get(jid) || [];
+      if (cached.length) {
+        await this._handleMessages(state, cached, { isHistory: true });
+      }
+
+      // 2) Need at least one real message key to paginate older history
+      let oldest = this._oldestCached(state, jid);
+      if (!oldest?.key?.id) {
+        // Wait a bit for initial sync / live messages
+        for (let i = 0; i < 5 && !oldest?.key?.id; i++) {
+          await sleep(2000);
+          oldest = this._oldestCached(state, jid);
+        }
+      }
+
+      if (!oldest?.key?.id) {
+        logger.warn(
+          { userId: state.userId, jid },
+          'No seed message yet for history pagination — synced whatever was available'
+        );
+        state.historySyncedJids.add(jid);
+        return;
+      }
+
+      // 3) Page backwards with fetchMessageHistory (max 50 per request)
+      for (let round = 0; round < HISTORY_MAX_ROUNDS; round++) {
+        oldest = this._oldestCached(state, jid);
+        if (!oldest?.key?.id) break;
+
+        const beforeCount = (state.msgCache.get(jid) || []).length;
+        const tsSec = Number(oldest.messageTimestamp || 0);
+
+        try {
+          await state.sock.fetchMessageHistory(HISTORY_BATCH, oldest.key, tsSec);
+        } catch (err) {
+          logger.warn(
+            { userId: state.userId, jid, err: err.message, round },
+            'fetchMessageHistory error'
+          );
+          break;
+        }
+
+        const gotBatch = await this.waitForHistoryBatch(state, 10000);
+        const afterCount = (state.msgCache.get(jid) || []).length;
+        const gained = afterCount - beforeCount;
+
+        logger.info(
+          { userId: state.userId, jid, round, gained, total: afterCount, gotBatch },
+          'History page fetched'
+        );
+
+        if (!gained) break;
+        if (afterCount >= (config.historyLimit || 500)) break;
+        await sleep(1200);
+      }
+
+      // Final flush (deduped in _handleMessages)
+      const finalCached = state.msgCache.get(jid) || [];
+      if (finalCached.length) {
+        await this._handleMessages(state, finalCached, { isHistory: true });
+      }
+
+      state.historySyncedJids.add(jid);
+      logger.info(
+        {
+          userId: state.userId,
+          jid,
+          chatName,
+          totalCached: (state.msgCache.get(jid) || []).length
+        },
+        'Full history sync complete'
+      );
+    } finally {
+      state.historySyncing.delete(jid);
+    }
+  }
+
+  _isMonitored(state, jid) {
+    if (!jid) return false;
+    if (state.monitoredJids.has(jid)) return true;
+    const bare = String(jid).split('@')[0];
+    for (const m of state.monitoredJids) {
+      if (String(m).split('@')[0] === bare) return true;
+    }
+    return false;
+  }
+
+  /** Scrape floor: max(monitored_at, last_scraped_at) in Unix seconds. */
+  _scrapeFloorSec(meta) {
+    if (!meta) return null;
+    let floorMs = meta.monitoredAtMs || 0;
+    if (meta.lastScrapedAtMs && meta.lastScrapedAtMs > floorMs) {
+      floorMs = meta.lastScrapedAtMs;
+    }
+    return floorMs ? Math.floor(floorMs / 1000) : null;
+  }
+
+  async _handleMessages(state, messages) {
+    const roomContacts = [];
+    const byChat = new Map();
+
+    for (const msg of messages) {
+      if (!msg?.message || msg.message.protocolMessage) continue;
+      const remoteJid = toCUs(msg.key?.remoteJid);
+      if (!remoteJid || isJidBroadcast(remoteJid) || remoteJid === 'status@broadcast') continue;
+
+      roomContacts.push({
+        id: remoteJid,
+        name: chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name),
+        avatar: null
+      });
+
+      if (!this._isMonitored(state, remoteJid)) continue;
+
+      const epochSec = Number(msg.messageTimestamp || 0);
+      const chatMeta = state.monitoredMeta?.get(remoteJid);
+      const floorSec = this._scrapeFloorSec(chatMeta);
+      if (floorSec && epochSec && epochSec <= floorSec) continue;
+
+      const msgKey = msg.key?.id || `${remoteJid}_${msg.messageTimestamp}`;
+      if (state.seenMsgKeys.has(msgKey)) continue;
+      state.seenMsgKeys.add(msgKey);
+      if (state.seenMsgKeys.size > 8000) {
+        state.seenMsgKeys = new Set(Array.from(state.seenMsgKeys).slice(-4000));
+      }
+
+      const text = extractText(msg);
+      if (!String(text).trim()) continue;
+      // Don't scrape common fillers (ok/hi/thanks/emoji-only/system notices)
+      if (isCommonJunkMessage(text)) continue;
+
+      // WhatsApp UI: right-side bubbles = mine, left-side = other person.
+      // Baileys exposes this as msg.key.fromMe (true = out / right, false = in / left).
+      const fromMe = msg.key?.fromMe === true;
+      const epochSecFinal = epochSec || Math.floor(Date.now() / 1000);
+      const ts = msg.messageTimestamp
+        ? new Date(epochSecFinal * 1000).toLocaleString()
+        : new Date().toLocaleString();
+
+      const sender = fromMe
+        ? 'Me'
+        : msg.pushName ||
+          chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name) ||
+          remoteJid.split('@')[0];
+
+      if (!byChat.has(remoteJid)) byChat.set(remoteJid, []);
+      byChat.get(remoteJid).push({
+        sender,
+        timestamp: String(ts),
+        message: String(text).trim(),
+        fromMe,
+        from_me: fromMe,
+        messageEpoch: epochSecFinal
+      });
+    }
+
+    if (roomContacts.length) {
+      const unique = [];
+      const seen = new Set();
+      for (const c of roomContacts) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        unique.push(c);
+      }
+      await backend.postContacts(state.userId, unique);
+    }
+
+    for (const [chatId, msgs] of byChat.entries()) {
+      for (let i = 0; i < msgs.length; i += 100) {
+        const slice = msgs.slice(i, i + 100);
+        await backend.postMessages(state.userId, {
+          chatId,
+          chatName: chatNameFrom(state.sock, chatId, state.monitoredMeta?.get(chatId)?.name),
+          messages: slice
+        });
+      }
+      const meta = state.monitoredMeta?.get(chatId);
+      if (meta && msgs.length) {
+        const maxEpoch = Math.max(...msgs.map((m) => Number(m.messageEpoch || 0)));
+        if (maxEpoch > 0) {
+          const ms = maxEpoch * 1000;
+          meta.lastScrapedAtMs = meta.lastScrapedAtMs ? Math.max(meta.lastScrapedAtMs, ms) : ms;
+        }
+      }
+      logger.info(
+        { userId: state.userId, chatId, count: msgs.length },
+        'Posted monitored messages'
+      );
+    }
+  }
+}
+
+module.exports = new SessionManager();
