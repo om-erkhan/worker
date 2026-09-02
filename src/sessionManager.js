@@ -35,15 +35,51 @@ function toCUs(jid) {
   return String(normalized);
 }
 
-function chatNameFrom(sock, jid, fallbackName) {
-  if (fallbackName) return fallbackName;
+function isPhoneLikeName(str) {
+  const cleaned = String(str || '').trim();
+  if (!cleaned) return true;
+  const digits = cleaned.replace(/\D/g, '');
+  const compact = cleaned.replace(/\s/g, '');
+  if (digits.length >= 10 && digits.length <= 20) {
+    const nonDigit = compact.replace(/\d/g, '').replace(/[+()-]/g, '');
+    if (nonDigit.length <= 2) return true;
+  }
+  if (/^92\d{10}$/.test(digits) || /^03\d{9}$/.test(digits)) return true;
+  return false;
+}
+
+function rememberChatName(state, jid, name) {
+  if (!state || !jid || !name) return;
+  const n = String(name).trim();
+  if (!n || isPhoneLikeName(n)) return;
+  state.nameByJid = state.nameByJid || new Map();
+  state.nameByJid.set(jid, n);
+}
+
+function chatNameFrom(sock, jid, fallbackName, state = null) {
+  if (fallbackName && !isPhoneLikeName(fallbackName)) return fallbackName;
+
+  const cached = state?.nameByJid?.get(jid);
+  if (cached && !isPhoneLikeName(cached)) return cached;
+
   try {
-    const meta = sock.contacts?.[jid] || sock.store?.contacts?.[jid];
-    if (meta?.name || meta?.notify || meta?.verifiedName) {
-      return meta.name || meta.notify || meta.verifiedName;
-    }
+    const meta = sock?.contacts?.[jid] || sock?.store?.contacts?.[jid];
+    const fromContact = meta?.name || meta?.notify || meta?.verifiedName;
+    if (fromContact && !isPhoneLikeName(fromContact)) return fromContact;
+
+    const chat = sock?.store?.chats?.get?.(jid);
+    const fromChat = chat?.name || chat?.subject;
+    if (fromChat && !isPhoneLikeName(fromChat)) return fromChat;
   } catch (_) {}
-  return String(jid).split('@')[0];
+
+  return null;
+}
+
+function resolveChatDisplayName(state, sock, jid, hints = {}) {
+  return (
+    chatNameFrom(sock, jid, hints.name || hints.subject || hints.fallbackName, state) ||
+    null
+  );
 }
 
 function extractText(msg) {
@@ -190,6 +226,7 @@ class SessionManager {
       connectedAt: null,
       monitoredJids: new Set(),
       monitoredMeta: new Map(), // jid -> { name }
+      nameByJid: new Map(), // jid -> display name (groups + contacts)
       seenMsgKeys: new Set(),
       historySyncedJids: new Set(),
       historySyncing: new Set(),
@@ -498,6 +535,7 @@ class SessionManager {
           logger.error({ userId: state.userId, err: err.message }, 'Failed posting QR status');
         }
         await this._syncChats(state);
+        await this._syncGroupNames(state);
         await this._refreshMonitored(state);
         if (state.monitoredTimer) clearInterval(state.monitoredTimer);
         state.monitoredTimer = setInterval(() => {
@@ -652,6 +690,34 @@ class SessionManager {
       } catch (_) {}
     });
 
+    sock.ev.on('contacts.upsert', async (contacts) => {
+      try {
+        await this._uploadContacts(state, contacts);
+      } catch (err) {
+        logger.warn({ userId: state.userId, err: err.message }, 'contacts.upsert failed');
+      }
+    });
+
+    sock.ev.on('contacts.update', async (contacts) => {
+      try {
+        await this._uploadContacts(state, contacts);
+      } catch (_) {}
+    });
+
+    sock.ev.on('groups.upsert', async (groups) => {
+      try {
+        await this._uploadGroups(state, groups);
+      } catch (err) {
+        logger.warn({ userId: state.userId, err: err.message }, 'groups.upsert failed');
+      }
+    });
+
+    sock.ev.on('groups.update', async (groups) => {
+      try {
+        await this._uploadGroups(state, groups);
+      } catch (_) {}
+    });
+
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (!messages?.length) return;
       try {
@@ -668,16 +734,65 @@ class SessionManager {
     for (const chat of chats || []) {
       const jid = toCUs(chat.id || chat.jid);
       if (!jid || isJidBroadcast(jid) || jid.endsWith('@newsletter')) continue;
-      const name =
-        chat.name ||
-        chat.subject ||
-        chatNameFrom(state.sock, jid) ||
-        jid.split('@')[0];
-      contacts.push({ id: jid, name, avatar: null });
+      const name = resolveChatDisplayName(state, state.sock, jid, {
+        name: chat.name,
+        subject: chat.subject
+      });
+      if (name) rememberChatName(state, jid, name);
+      contacts.push({
+        id: jid,
+        name: name || chat.name || chat.subject || jid.split('@')[0],
+        avatar: null
+      });
     }
     if (!contacts.length) return;
     await backend.postContacts(state.userId, contacts);
     logger.info({ userId: state.userId, count: contacts.length }, 'Uploaded chatrooms');
+  }
+
+  async _uploadContacts(state, contactsIn) {
+    const contacts = [];
+    for (const c of contactsIn || []) {
+      const jid = toCUs(c.id || c.jid);
+      const name = c.name || c.notify || c.verifiedName;
+      if (!jid || !name || isPhoneLikeName(name)) continue;
+      rememberChatName(state, jid, name);
+      contacts.push({ id: jid, name, avatar: null });
+    }
+    if (!contacts.length) return;
+    await backend.postContacts(state.userId, contacts);
+    logger.info({ userId: state.userId, count: contacts.length }, 'Uploaded contact names');
+  }
+
+  async _uploadGroups(state, groups) {
+    const contacts = [];
+    for (const g of groups || []) {
+      const jid = toCUs(g.id || g.jid);
+      const name = g.subject || g.name;
+      if (!jid || !name || isPhoneLikeName(name)) continue;
+      rememberChatName(state, jid, name);
+      contacts.push({ id: jid, name, avatar: null });
+    }
+    if (!contacts.length) return;
+    await backend.postContacts(state.userId, contacts);
+    logger.info({ userId: state.userId, count: contacts.length }, 'Uploaded group names');
+  }
+
+  async _syncGroupNames(state) {
+    if (!state.sock?.groupFetchAllParticipating) return;
+    try {
+      const groups = await state.sock.groupFetchAllParticipating();
+      const list = Object.entries(groups || {}).map(([jid, meta]) => ({
+        id: jid,
+        jid,
+        subject: meta?.subject,
+        name: meta?.subject
+      }));
+      if (list.length) await this._uploadGroups(state, list);
+      logger.info({ userId: state.userId, count: list.length }, 'Synced group names from WhatsApp');
+    } catch (err) {
+      logger.warn({ userId: state.userId, err: err.message }, 'groupFetchAllParticipating failed');
+    }
   }
 
   async _syncChats(state) {
@@ -703,7 +818,7 @@ class SessionManager {
           : null;
       const lastScrapedAtMs = c.last_scraped_at ? Date.parse(c.last_scraped_at) : null;
       state.monitoredMeta.set(jid, {
-        name: c.name || chatNameFrom(state.sock, jid),
+        name: c.name || chatNameFrom(state.sock, jid, null, state),
         monitoredAtMs: Number.isFinite(monitoredAtMs) ? monitoredAtMs : Date.now(),
         lastScrapedAtMs: Number.isFinite(lastScrapedAtMs) ? lastScrapedAtMs : null
       });
@@ -726,6 +841,23 @@ class SessionManager {
     );
 
     for (const jid of newlyMonitored) {
+      // Forward-only: no WhatsApp history pagination, but flush anything already in cache
+      // (messages that arrived between portal monitor click and this poll).
+      const cached = state.msgCache.get(jid) || [];
+      if (cached.length) {
+        try {
+          await this._handleMessages(state, cached);
+          logger.info(
+            { userId: state.userId, jid, cached: cached.length },
+            'Flushed cached messages for newly monitored chat'
+          );
+        } catch (err) {
+          logger.warn(
+            { userId: state.userId, jid, err: err.message },
+            'Failed flushing cache for newly monitored chat'
+          );
+        }
+      }
       state.historySyncedJids.add(jid);
       logger.info(
         { userId: state.userId, jid, chatName: state.monitoredMeta.get(jid)?.name },
@@ -853,7 +985,7 @@ class SessionManager {
 
       roomContacts.push({
         id: remoteJid,
-        name: chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name),
+        name: chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name, state),
         avatar: null
       });
 
@@ -862,7 +994,7 @@ class SessionManager {
       const epochSec = Number(msg.messageTimestamp || 0);
       const chatMeta = state.monitoredMeta?.get(remoteJid);
       const floorSec = this._scrapeFloorSec(chatMeta);
-      if (floorSec && epochSec && epochSec <= floorSec) continue;
+      if (floorSec != null && epochSec && epochSec < floorSec) continue;
 
       const msgKey = msg.key?.id || `${remoteJid}_${msg.messageTimestamp}`;
       if (state.seenMsgKeys.has(msgKey)) continue;
@@ -887,7 +1019,7 @@ class SessionManager {
       const sender = fromMe
         ? 'Me'
         : msg.pushName ||
-          chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name) ||
+          chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name, state) ||
           remoteJid.split('@')[0];
 
       if (!byChat.has(remoteJid)) byChat.set(remoteJid, []);
@@ -917,7 +1049,7 @@ class SessionManager {
         const slice = msgs.slice(i, i + 100);
         await backend.postMessages(state.userId, {
           chatId,
-          chatName: chatNameFrom(state.sock, chatId, state.monitoredMeta?.get(chatId)?.name),
+          chatName: chatNameFrom(state.sock, chatId, state.monitoredMeta?.get(chatId)?.name, state),
           messages: slice
         });
       }

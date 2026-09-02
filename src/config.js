@@ -8,7 +8,7 @@ module.exports = {
   sessionsDir: path.resolve(process.env.SESSIONS_DIR || './sessions'),
   autoStartFromClaims: String(process.env.AUTO_START_FROM_CLAIMS || 'true') === 'true',
   claimPollMs: parseInt(process.env.CLAIM_POLL_MS || '5000', 10),
-  monitoredPollMs: parseInt(process.env.MONITORED_POLL_MS || '15000', 10),
+  monitoredPollMs: parseInt(process.env.MONITORED_POLL_MS || '5000', 10),
   historyLimit: parseInt(process.env.HISTORY_LIMIT || '500', 10),
   // QR codes die quickly; if last QR is older than this while not linked, force refresh
   staleQrMs: parseInt(process.env.STALE_QR_MS || '90000', 10),
