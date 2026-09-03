@@ -67,13 +67,21 @@ app.post('/sessions/:userId/fresh-qr', requireApiKey, async (req, res) => {
   }
 });
 
+let claimPollRunning = false;
+
 async function pollClaimsAndStart() {
   if (!config.autoStartFromClaims) return;
+  if (claimPollRunning) return;
+  claimPollRunning = true;
   try {
     const claims = await backend.getClaimSessions();
     const claimedIds = new Set();
     const now = Date.now();
-    let waitingStarts = 0;
+    const qrBusy = sessions
+      .list()
+      .filter((s) => ['starting', 'qr', 'reconnecting'].includes(s.status) && !s.connectedAt)
+      .length;
+    let waitingStarts = qrBusy;
 
     // Prefer users who actually opened the portal recently (updated_at).
     const sorted = [...claims].sort(
@@ -158,6 +166,8 @@ async function pollClaimsAndStart() {
     }
   } catch (err) {
     logger.warn({ err: err.message }, 'Claim poll failed');
+  } finally {
+    claimPollRunning = false;
   }
 }
 

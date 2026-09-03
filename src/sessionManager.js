@@ -557,9 +557,10 @@ class SessionManager {
           }
           logger.error({ userId: state.userId, err: err.message }, 'Failed posting QR status');
         }
-        await this._syncChats(state);
-        await this._syncGroupNames(state);
+        // Scrape first — name sync can wait (used to block monitor start for minutes).
         await this._refreshMonitored(state);
+        this._syncChats(state).catch(() => {});
+        this._syncGroupNames(state).catch(() => {});
         if (state.monitoredTimer) clearInterval(state.monitoredTimer);
         state.monitoredTimer = setInterval(() => {
           this._refreshMonitored(state).catch(() => {});

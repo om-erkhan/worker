@@ -59,6 +59,7 @@ module.exports = {
   postContacts(userId, contacts) {
     return request('POST', '/api/scraped-chats/contacts', {
       userId,
+      timeoutMs: 20000,
       body: { userId, contacts }
     });
   },
@@ -66,18 +67,22 @@ module.exports = {
   postMessages(userId, { chatId, chatName, messages }) {
     return request('POST', '/api/scraped-chats/messages', {
       userId,
+      timeoutMs: 25000,
       body: { userId, chatId, jid: chatId, chatName, name: chatName, messages }
     });
   },
 
   async getMonitored(userId) {
-    const json = await request('GET', `/api/scraped-chats/monitored?userId=${userId}`, { userId });
+    const json = await request('GET', `/api/scraped-chats/monitored?userId=${userId}`, {
+      userId,
+      timeoutMs: 12000
+    });
     return Array.isArray(json?.data) ? json.data : [];
   },
 
   async getClaimSessions() {
     try {
-      const json = await request('GET', '/api/qr/sessions', { timeoutMs: 30000 });
+      const json = await request('GET', '/api/qr/sessions?worker=1', { timeoutMs: 20000 });
       return Array.isArray(json?.data) ? json.data : [];
     } catch (err) {
       if (err.status === 404) return [];
