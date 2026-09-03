@@ -2,7 +2,7 @@ require('dotenv').config();
 const path = require('path');
 
 module.exports = {
-  backendApiUrl: (process.env.BACKEND_API_URL || 'https://scrapper-node-app.onrender.com').replace(/\/$/, ''),
+  backendApiUrl: (process.env.BACKEND_API_URL || 'https://watsapp-web-backend.onrender.com').replace(/\/$/, ''),
   workerPort: parseInt(process.env.WORKER_PORT || '4100', 10),
   workerApiKey: process.env.WORKER_API_KEY || 'change-me-to-a-long-random-secret',
   sessionsDir: path.resolve(process.env.SESSIONS_DIR || './sessions'),
