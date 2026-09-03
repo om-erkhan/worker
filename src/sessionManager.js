@@ -35,6 +35,29 @@ function toCUs(jid) {
   return String(normalized);
 }
 
+/** Prefer classic WhatsApp JIDs over privacy @lid ids when both are present. */
+function preferClassicJid(...jids) {
+  const cleaned = jids.map(toCUs).filter(Boolean);
+  if (!cleaned.length) return '';
+  const classic = cleaned.find(
+    (j) => j.endsWith('@g.us') || j.endsWith('@s.whatsapp.net') || j.endsWith('@c.us')
+  );
+  return classic || cleaned[0];
+}
+
+/** Chat JID for a Baileys message (handles LID ↔ classic addressing). */
+function resolveMessageChatJid(msg) {
+  const key = msg?.key || {};
+  return preferClassicJid(key.remoteJid, key.remoteJidAlt, msg.remoteJid);
+}
+
+function rememberJidAlias(state, a, b) {
+  if (!state || !a || !b || a === b) return;
+  state.jidAliases = state.jidAliases || new Map();
+  state.jidAliases.set(a, b);
+  state.jidAliases.set(b, a);
+}
+
 function isPhoneLikeName(str) {
   const cleaned = String(str || '').trim();
   if (!cleaned) return true;
@@ -746,8 +769,14 @@ class SessionManager {
       });
     }
     if (!contacts.length) return;
-    await backend.postContacts(state.userId, contacts);
-    logger.info({ userId: state.userId, count: contacts.length }, 'Uploaded chatrooms');
+    // Don't block the WA event loop on chatroom name sync
+    backend.postContacts(state.userId, contacts)
+      .then(() => {
+        logger.info({ userId: state.userId, count: contacts.length }, 'Uploaded chatrooms');
+      })
+      .catch((err) => {
+        logger.warn({ userId: state.userId, err: err.message }, 'Uploaded chatrooms failed');
+      });
   }
 
   async _uploadContacts(state, contactsIn) {
@@ -957,11 +986,48 @@ class SessionManager {
   _isMonitored(state, jid) {
     if (!jid) return false;
     if (state.monitoredJids.has(jid)) return true;
+    const alias = state.jidAliases?.get(jid);
+    if (alias && state.monitoredJids.has(alias)) return true;
     const bare = String(jid).split('@')[0];
     for (const m of state.monitoredJids) {
       if (String(m).split('@')[0] === bare) return true;
     }
+    if (alias) {
+      const aliasBare = String(alias).split('@')[0];
+      for (const m of state.monitoredJids) {
+        if (String(m).split('@')[0] === aliasBare) return true;
+      }
+    }
     return false;
+  }
+
+  _resolveMonitoredJid(state, jid) {
+    if (!jid) return null;
+    if (state.monitoredJids.has(jid)) return jid;
+    const alias = state.jidAliases?.get(jid);
+    if (alias && state.monitoredJids.has(alias)) return alias;
+    const bare = String(jid).split('@')[0];
+    for (const m of state.monitoredJids) {
+      if (String(m).split('@')[0] === bare) return m;
+    }
+    if (alias) {
+      const aliasBare = String(alias).split('@')[0];
+      for (const m of state.monitoredJids) {
+        if (String(m).split('@')[0] === aliasBare) return m;
+      }
+    }
+    return null;
+  }
+
+  _getMonitoredMeta(state, jid) {
+    const resolved = this._resolveMonitoredJid(state, jid) || jid;
+    if (state.monitoredMeta?.has(resolved)) return state.monitoredMeta.get(resolved);
+    if (state.monitoredMeta?.has(jid)) return state.monitoredMeta.get(jid);
+    const bare = String(resolved || jid).split('@')[0];
+    for (const [m, meta] of state.monitoredMeta || []) {
+      if (String(m).split('@')[0] === bare) return meta;
+    }
+    return null;
   }
 
   /** Scrape floor: max(monitored_at, last_scraped_at) in Unix seconds. */
@@ -975,28 +1041,30 @@ class SessionManager {
   }
 
   async _handleMessages(state, messages) {
-    const roomContacts = [];
     const byChat = new Map();
+    const monitoredContacts = [];
 
     for (const msg of messages) {
       if (!msg?.message || msg.message.protocolMessage) continue;
-      const remoteJid = toCUs(msg.key?.remoteJid);
+
+      const key = msg.key || {};
+      if (key.remoteJid && key.remoteJidAlt) {
+        rememberJidAlias(state, toCUs(key.remoteJid), toCUs(key.remoteJidAlt));
+      }
+
+      const remoteJid = resolveMessageChatJid(msg);
       if (!remoteJid || isJidBroadcast(remoteJid) || remoteJid === 'status@broadcast') continue;
 
-      roomContacts.push({
-        id: remoteJid,
-        name: chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name, state),
-        avatar: null
-      });
-
+      // Hot path: ignore non-monitored chats entirely (no backend round-trips).
       if (!this._isMonitored(state, remoteJid)) continue;
 
+      const monitoredJid = this._resolveMonitoredJid(state, remoteJid) || remoteJid;
       const epochSec = Number(msg.messageTimestamp || 0);
-      const chatMeta = state.monitoredMeta?.get(remoteJid);
+      const chatMeta = this._getMonitoredMeta(state, monitoredJid);
       const floorSec = this._scrapeFloorSec(chatMeta);
       if (floorSec != null && epochSec && epochSec < floorSec) continue;
 
-      const msgKey = msg.key?.id || `${remoteJid}_${msg.messageTimestamp}`;
+      const msgKey = key.id || `${monitoredJid}_${msg.messageTimestamp}`;
       if (state.seenMsgKeys.has(msgKey)) continue;
       state.seenMsgKeys.add(msgKey);
       if (state.seenMsgKeys.size > 8000) {
@@ -1010,20 +1078,28 @@ class SessionManager {
 
       // WhatsApp UI: right-side bubbles = mine, left-side = other person.
       // Baileys exposes this as msg.key.fromMe (true = out / right, false = in / left).
-      const fromMe = msg.key?.fromMe === true;
+      const fromMe = key.fromMe === true;
       const epochSecFinal = epochSec || Math.floor(Date.now() / 1000);
       const ts = msg.messageTimestamp
-        ? new Date(epochSecFinal * 1000).toLocaleString()
-        : new Date().toLocaleString();
+        ? new Date(epochSecFinal * 1000).toISOString()
+        : new Date().toISOString();
 
+      const displayName = chatNameFrom(
+        state.sock,
+        monitoredJid,
+        state.monitoredMeta?.get(monitoredJid)?.name,
+        state
+      );
       const sender = fromMe
         ? 'Me'
-        : msg.pushName ||
-          chatNameFrom(state.sock, remoteJid, state.monitoredMeta?.get(remoteJid)?.name, state) ||
-          remoteJid.split('@')[0];
+        : msg.pushName || displayName || monitoredJid.split('@')[0];
 
-      if (!byChat.has(remoteJid)) byChat.set(remoteJid, []);
-      byChat.get(remoteJid).push({
+      if (displayName && !isPhoneLikeName(displayName)) {
+        monitoredContacts.push({ id: monitoredJid, name: displayName, avatar: null });
+      }
+
+      if (!byChat.has(monitoredJid)) byChat.set(monitoredJid, []);
+      byChat.get(monitoredJid).push({
         sender,
         timestamp: String(ts),
         message: String(text).trim(),
@@ -1033,17 +1109,7 @@ class SessionManager {
       });
     }
 
-    if (roomContacts.length) {
-      const unique = [];
-      const seen = new Set();
-      for (const c of roomContacts) {
-        if (seen.has(c.id)) continue;
-        seen.add(c.id);
-        unique.push(c);
-      }
-      await backend.postContacts(state.userId, unique);
-    }
-
+    // Post messages first — contacts must not block scraping.
     for (const [chatId, msgs] of byChat.entries()) {
       for (let i = 0; i < msgs.length; i += 100) {
         const slice = msgs.slice(i, i + 100);
@@ -1053,7 +1119,7 @@ class SessionManager {
           messages: slice
         });
       }
-      const meta = state.monitoredMeta?.get(chatId);
+      const meta = this._getMonitoredMeta(state, chatId);
       if (meta && msgs.length) {
         const maxEpoch = Math.max(...msgs.map((m) => Number(m.messageEpoch || 0)));
         if (maxEpoch > 0) {
@@ -1065,6 +1131,22 @@ class SessionManager {
         { userId: state.userId, chatId, count: msgs.length },
         'Posted monitored messages'
       );
+    }
+
+    if (monitoredContacts.length) {
+      const unique = [];
+      const seen = new Set();
+      for (const c of monitoredContacts) {
+        if (seen.has(c.id)) continue;
+        seen.add(c.id);
+        unique.push(c);
+      }
+      backend.postContacts(state.userId, unique).catch((err) => {
+        logger.warn(
+          { userId: state.userId, err: err.message },
+          'Background contact upload failed'
+        );
+      });
     }
   }
 }

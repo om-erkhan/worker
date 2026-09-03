@@ -73,8 +73,14 @@ async function pollClaimsAndStart() {
     const claims = await backend.getClaimSessions();
     const claimedIds = new Set();
     const now = Date.now();
+    let waitingStarts = 0;
 
-    for (const claim of claims) {
+    // Prefer users who actually opened the portal recently (updated_at).
+    const sorted = [...claims].sort(
+      (a, b) => Date.parse(b.updated_at || 0) - Date.parse(a.updated_at || 0)
+    );
+
+    for (const claim of sorted) {
       const userId = Number(claim.userId || claim.user_id);
       if (!userId) continue;
       // Default admin is not a WhatsApp client — never auto-start it
@@ -108,6 +114,18 @@ async function pollClaimsAndStart() {
 
       if (existing && ['starting', 'qr', 'connected', 'reconnecting'].includes(existing.status)) {
         continue;
+      }
+
+      // Don't spin up QR for every stale waiting row in DB (was starting 50+ at once).
+      if (claim.status === 'waiting') {
+        const updatedAt = Date.parse(claim.updated_at || 0);
+        if (!updatedAt || now - updatedAt > config.claimRecentMs) {
+          continue;
+        }
+        if (waitingStarts >= config.maxWaitingStarts) {
+          continue;
+        }
+        waitingStarts += 1;
       }
 
       // waiting => need QR

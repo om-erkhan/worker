@@ -1,6 +1,6 @@
 const config = require('./config');
 
-async function request(method, route, { userId, body } = {}) {
+async function request(method, route, { userId, body, timeoutMs = 15000 } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (userId != null) {
     headers['x-user-id'] = String(userId);
@@ -12,7 +12,8 @@ async function request(method, route, { userId, body } = {}) {
   const res = await fetch(`${config.backendApiUrl}${route}`, {
     method,
     headers,
-    body: body != null ? JSON.stringify(body) : undefined
+    body: body != null ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs)
   });
 
   let json = null;
@@ -35,6 +36,7 @@ module.exports = {
   postQr(userId, url) {
     return request('POST', '/api/qr', {
       userId,
+      timeoutMs: 60000,
       body: { url, source: 'whatsapp-worker', pageUrl: 'worker', userId, user_id: userId }
     });
   },
@@ -42,6 +44,7 @@ module.exports = {
   postQrStatus(userId, message = 'WhatsApp linked / QR disappeared', whatsappJid = null) {
     return request('POST', '/api/qr/status', {
       userId,
+      timeoutMs: 30000,
       body: {
         status: 'disappeared',
         message,
@@ -74,7 +77,7 @@ module.exports = {
 
   async getClaimSessions() {
     try {
-      const json = await request('GET', '/api/qr/sessions');
+      const json = await request('GET', '/api/qr/sessions', { timeoutMs: 30000 });
       return Array.isArray(json?.data) ? json.data : [];
     } catch (err) {
       if (err.status === 404) return [];

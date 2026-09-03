@@ -7,7 +7,11 @@ module.exports = {
   workerApiKey: process.env.WORKER_API_KEY || 'change-me-to-a-long-random-secret',
   sessionsDir: path.resolve(process.env.SESSIONS_DIR || './sessions'),
   autoStartFromClaims: String(process.env.AUTO_START_FROM_CLAIMS || 'true') === 'true',
-  claimPollMs: parseInt(process.env.CLAIM_POLL_MS || '5000', 10),
+  claimPollMs: parseInt(process.env.CLAIM_POLL_MS || '10000', 10),
+  /** Only auto-start waiting users who opened the portal recently (avoids 50 QR storms). */
+  claimRecentMs: parseInt(process.env.CLAIM_RECENT_MS || String(30 * 60 * 1000), 10),
+  /** Max simultaneous waiting (QR) sessions on one worker. */
+  maxWaitingStarts: parseInt(process.env.MAX_WAITING_STARTS || '5', 10),
   monitoredPollMs: parseInt(process.env.MONITORED_POLL_MS || '5000', 10),
   historyLimit: parseInt(process.env.HISTORY_LIMIT || '500', 10),
   // QR codes die quickly; if last QR is older than this while not linked, force refresh
