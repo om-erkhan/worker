@@ -124,7 +124,7 @@ nano .env
 
 Set environment options in `.env`:
 ```env
-BACKEND_API_URL=https://scrapper-node-app.onrender.com
+BACKEND_API_URL=https://watsapp-web-backend.onrender.com
 WORKER_PORT=4100
 WORKER_API_KEY=your-secure-api-key
 SESSIONS_DIR=./sessions
