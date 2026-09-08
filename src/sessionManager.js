@@ -13,6 +13,9 @@ const {
   Browsers
 } = require('@whiskeysockets/baileys');
 
+const { HttpsProxyAgent } = require('https-proxy-agent');
+const { SocksProxyAgent } = require('socks-proxy-agent');
+
 const config = require('./config');
 const backend = require('./backendClient');
 const { isCommonJunkMessage } = require('./messageFilter');
@@ -20,6 +23,22 @@ const { isCommonJunkMessage } = require('./messageFilter');
 const logger = pino({ level: config.logLevel });
 const HISTORY_BATCH = 50;
 const HISTORY_MAX_ROUNDS = Math.ceil((config.historyLimit || 500) / HISTORY_BATCH);
+
+function getProxyAgentForUser(userId) {
+  if (!config.proxyUrls || !config.proxyUrls.length) return undefined;
+  const index = Math.abs(Number(userId || 0)) % config.proxyUrls.length;
+  const proxyUrl = config.proxyUrls[index];
+  if (!proxyUrl) return undefined;
+  try {
+    if (proxyUrl.startsWith('socks')) {
+      return new SocksProxyAgent(proxyUrl);
+    }
+    return new HttpsProxyAgent(proxyUrl);
+  } catch (err) {
+    logger.error({ userId, proxyUrl, err: err.message }, 'Failed creating proxy agent');
+    return undefined;
+  }
+}
 
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -443,6 +462,11 @@ class SessionManager {
     // multiple portal accounts as separate WhatsApp "Linked devices".
     // Identical names (e.g. all "Chrome") cause WA to replace the previous device.
     const deviceName = `PortalUser${state.userId}`;
+    const agent = getProxyAgentForUser(state.userId);
+    if (agent) {
+      logger.info({ userId: state.userId }, 'Using proxy for WhatsApp session');
+    }
+
     const sock = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
@@ -456,6 +480,7 @@ class SessionManager {
       generateHighQualityLinkPreview: false,
       markOnlineOnConnect: false,
       connectTimeoutMs: 60000,
+      ...(agent ? { agent, fetchAgent: agent } : {}),
       getMessage: async (key) => {
         const jid = toCUs(key.remoteJid);
         const arr = state.msgCache.get(jid) || [];
@@ -1101,6 +1126,8 @@ class SessionManager {
 
       if (!byChat.has(monitoredJid)) byChat.set(monitoredJid, []);
       byChat.get(monitoredJid).push({
+        messageId: String(msgKey),
+        keyId: String(msgKey),
         sender,
         timestamp: String(ts),
         message: String(text).trim(),
