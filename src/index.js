@@ -77,6 +77,31 @@ async function pollClaimsAndStart() {
     const claims = await backend.getClaimSessions();
     const claimedIds = new Set();
     const now = Date.now();
+    const activeClaimsMap = new Map();
+    for (const c of claims) {
+      const uId = Number(c.userId || c.user_id);
+      if (uId) activeClaimsMap.set(uId, c);
+    }
+
+    // 1) Stop idle un-scanned QR sessions older than 3 minutes or whose claim updated_at is stale
+    for (const s of sessions.list()) {
+      if (s.connectedAt || s.status === 'connected') continue;
+      if (s.status === 'qr' || s.status === 'reconnecting' || s.status === 'starting') {
+        const claim = activeClaimsMap.get(s.userId);
+        const claimUpdatedAt = claim?.updated_at ? Date.parse(claim.updated_at) : 0;
+        const claimIsStale = !claim || (claim.status === 'waiting' && claimUpdatedAt && (now - claimUpdatedAt > config.claimRecentMs));
+        const qrIsIdle = s.lastQrAt && (now - Date.parse(s.lastQrAt) > 3 * 60 * 1000);
+
+        if (claimIsStale || (qrIsIdle && claim?.status === 'waiting')) {
+          logger.info(
+            { userId: s.userId, status: s.status, claimStale: claimIsStale, qrIdle: qrIsIdle },
+            'Stopping idle/stale un-scanned QR session to free up worker slot'
+          );
+          await sessions.stop(s.userId);
+        }
+      }
+    }
+
     const qrBusy = sessions
       .list()
       .filter((s) => ['starting', 'qr', 'reconnecting'].includes(s.status) && !s.connectedAt)
@@ -150,12 +175,10 @@ async function pollClaimsAndStart() {
       await sessions.start(userId);
     }
 
-    // Stop non-claimed sessions. Keep multi-user same-WA: each linked claim stays alive.
-    // Never tear down a healthy connected session — another portal user linking the
-    // same phone must not steal / kill this user's live socket.
+    // Stop non-claimed sessions (except connected ones)
     for (const row of sessions.list()) {
       if (claimedIds.has(row.userId)) continue;
-      if (row.status === 'connected' || row.status === 'qr' || row.status === 'reconnecting') {
+      if (row.status === 'connected') {
         continue;
       }
       logger.info(
