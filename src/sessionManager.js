@@ -394,24 +394,50 @@ class SessionManager {
 
   _cacheMessages(state, messages) {
     for (const msg of messages || []) {
-      const jid = toCUs(msg?.key?.remoteJid);
-      if (!jid || !msg?.key?.id) continue;
-      if (!state.msgCache.has(jid)) state.msgCache.set(jid, []);
-      const arr = state.msgCache.get(jid);
-      if (arr.some((m) => m.key?.id === msg.key.id)) continue;
-      arr.push(msg);
-      // keep newest/oldest usable set bounded
-      if (arr.length > (config.historyLimit || 500) + 100) {
-        arr.sort(
-          (a, b) => Number(a.messageTimestamp || 0) - Number(b.messageTimestamp || 0)
-        );
-        state.msgCache.set(jid, arr.slice(-(config.historyLimit || 500)));
+      const key = msg?.key || {};
+      if (!key.id) continue;
+      const jids = [
+        resolveMessageChatJid(msg),
+        toCUs(key.remoteJid),
+        toCUs(key.remoteJidAlt)
+      ].filter(Boolean);
+      const unique = [...new Set(jids)];
+      if (unique.length >= 2) rememberJidAlias(state, unique[0], unique[1]);
+      for (const jid of unique) {
+        if (!state.msgCache.has(jid)) state.msgCache.set(jid, []);
+        const arr = state.msgCache.get(jid);
+        if (arr.some((m) => m.key?.id === key.id)) continue;
+        arr.push(msg);
+        const catchingUp = state.historySyncing && state.historySyncing.size > 0;
+        const limit = (config.historyLimit || 500) + 100;
+        if (!catchingUp && arr.length > limit) {
+          arr.sort(
+            (a, b) => Number(a.messageTimestamp || 0) - Number(b.messageTimestamp || 0)
+          );
+          state.msgCache.set(jid, arr.slice(-limit));
+        }
       }
     }
   }
 
+  _cachedList(state, jid) {
+    const ids = new Set([jid, this._resolveMonitoredJid(state, jid), state.jidAliases?.get(jid)].filter(Boolean));
+    const bare = String(jid || '').split('@')[0];
+    for (const [k] of state.msgCache || []) {
+      if (String(k).split('@')[0] === bare) ids.add(k);
+    }
+    const byId = new Map();
+    for (const id of ids) {
+      for (const msg of state.msgCache.get(id) || []) {
+        const mid = msg?.key?.id;
+        if (mid && !byId.has(mid)) byId.set(mid, msg);
+      }
+    }
+    return [...byId.values()];
+  }
+
   _oldestCached(state, jid) {
-    const arr = state.msgCache.get(jid) || [];
+    const arr = this._cachedList(state, jid);
     if (!arr.length) return null;
     return arr.reduce((oldest, msg) => {
       if (!oldest) return msg;
@@ -796,6 +822,7 @@ class SessionManager {
       if (!messages?.length) return;
       try {
         this._cacheMessages(state, messages);
+        this._notifyHistoryWaiters(state);
         await this._handleMessages(state, messages, { type });
       } catch (err) {
         logger.error({ userId: state.userId, err: err.message }, 'messages.upsert failed');
@@ -974,19 +1001,19 @@ class SessionManager {
     );
 
     try {
-      const cached = state.msgCache.get(jid) || [];
+      // Wait until WhatsApp has sent some messages for this chat (history or live).
+      let oldest = this._oldestCached(state, jid);
+      for (let i = 0; i < 20 && !oldest?.key?.id; i++) {
+        await this.waitForHistoryBatch(state, 3000);
+        oldest = this._oldestCached(state, jid);
+      }
+
+      const cached = this._cachedList(state, jid);
       if (cached.length) {
         await this._handleMessages(state, cached);
       }
 
-      let oldest = this._oldestCached(state, jid);
-      if (!oldest?.key?.id) {
-        for (let i = 0; i < 15 && !oldest?.key?.id; i++) {
-          await sleep(2000);
-          oldest = this._oldestCached(state, jid);
-        }
-      }
-
+      oldest = this._oldestCached(state, jid);
       if (!oldest?.key?.id) {
         logger.warn(
           { userId: state.userId, jid },
@@ -1007,7 +1034,7 @@ class SessionManager {
           break;
         }
 
-        const beforeCount = (state.msgCache.get(jid) || []).length;
+        const beforeCount = this._cachedList(state, jid).length;
         try {
           await state.sock.fetchMessageHistory(HISTORY_BATCH, oldest.key, oldestSec);
         } catch (err) {
@@ -1015,28 +1042,49 @@ class SessionManager {
             { userId: state.userId, jid, err: err.message, round },
             'fetchMessageHistory error'
           );
-          break;
+          return;
         }
 
-        const gotBatch = await this.waitForHistoryBatch(state, 10000);
-        const afterCount = (state.msgCache.get(jid) || []).length;
+        const gotBatch = await this.waitForHistoryBatch(state, 15000);
+        const afterCount = this._cachedList(state, jid).length;
         const gained = afterCount - beforeCount;
         logger.info(
-          { userId: state.userId, jid, round, gained, total: afterCount, gotBatch },
+          { userId: state.userId, jid, round, gained, total: afterCount, gotBatch, oldestSec },
           'Catch-up history page fetched'
         );
-        if (!gained) break;
-        await sleep(800);
+        if (gained) {
+          await this._handleMessages(state, this._cachedList(state, jid));
+          await sleep(800);
+          continue;
+        }
+        if (!gotBatch) {
+          logger.warn(
+            { userId: state.userId, jid, round },
+            'Catch-up page timed out — will retry'
+          );
+          return;
+        }
+        break;
       }
 
-      const finalCached = state.msgCache.get(jid) || [];
+      const finalCached = this._cachedList(state, jid);
       if (finalCached.length) {
         await this._handleMessages(state, finalCached);
       }
 
+      oldest = this._oldestCached(state, jid);
+      const oldestSec = Number(oldest?.messageTimestamp || 0);
+      if (floorSec && oldestSec && oldestSec > floorSec) {
+        logger.warn(
+          { userId: state.userId, jid, oldestSec, floorSec },
+          'Catch-up stopped before reaching last scraped time — will retry'
+        );
+        return;
+      }
+
       state.historySyncedJids.add(jid);
       logger.info(
-        { userId: state.userId, jid, chatName, totalCached: (state.msgCache.get(jid) || []).length },
+        { userId: state.userId, jid, chatName, totalCached: this._cachedList(state, jid).length },
         'Catch-up history complete'
       );
     } finally {
