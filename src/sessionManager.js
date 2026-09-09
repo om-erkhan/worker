@@ -234,9 +234,8 @@ class SessionManager {
     await this.stop(id, { logout: false });
     if (wipeAuth) {
       this.clearAuth(id);
-      try {
-        await backend.resetClaimToWaiting(id);
-      } catch (_) {}
+      // Do not reset the claim / pause scraping — portal logout and QR refresh
+      // must not mark the user disconnected or freeze chat ingest.
     }
     return this.start(id);
   }
@@ -274,6 +273,7 @@ class SessionManager {
       historySyncing: new Set(),
       msgCache: new Map(), // jid -> WAMessage[]
       historyWaiters: new Set(),
+      jidAliases: new Map(),
       error: null,
       errorAt: null,
       stopping: false,
@@ -324,13 +324,7 @@ class SessionManager {
       state.reconnectTimer = null;
     }
     try {
-      if (logout) {
-        try {
-          await backend.pauseScraping(id);
-        } catch (pauseErr) {
-          logger.warn({ userId: id, err: pauseErr.message }, 'Failed stamping scrape pause on logout');
-        }
-      }
+      // Never pause scraping on logout. Portal/QR stop must not freeze last_scraped_at.
       if (logout && state.sock?.logout) await state.sock.logout();
       else if (state.sock?.end) state.sock.end(undefined);
     } catch (_) {}
@@ -583,12 +577,24 @@ class SessionManager {
           logger.error({ userId: state.userId, err: err.message }, 'Failed posting QR status');
         }
         // Scrape first — name sync can wait (used to block monitor start for minutes).
-        await this._refreshMonitored(state);
+        try {
+          await this._refreshMonitored(state);
+        } catch (err) {
+          logger.error(
+            { userId: state.userId, err: err.message },
+            'Failed refreshing monitored chats on connect — will retry on poll'
+          );
+        }
         this._syncChats(state).catch(() => {});
         this._syncGroupNames(state).catch(() => {});
         if (state.monitoredTimer) clearInterval(state.monitoredTimer);
         state.monitoredTimer = setInterval(() => {
-          this._refreshMonitored(state).catch(() => {});
+          this._refreshMonitored(state).catch((err) => {
+            logger.warn(
+              { userId: state.userId, err: err.message },
+              'Monitored chat poll failed'
+            );
+          });
         }, config.monitoredPollMs);
       }
 
@@ -610,25 +616,13 @@ class SessionManager {
         );
 
         if (!shouldReconnect) {
-          // Logged out / invalid session: stamp scrape pause, wipe auth for fresh QR
-          logger.warn({ userId: state.userId, code }, 'Session logged out — clearing auth for fresh QR');
-          try {
-            await backend.pauseScraping(state.userId);
-          } catch (pauseErr) {
-            logger.warn(
-              { userId: state.userId, err: pauseErr.message },
-              'Failed stamping scrape pause on session logout'
-            );
-          }
+          // WhatsApp logged out: drop the socket/QR only. Keep claim linked and do
+          // not pause scraping so ingest resumes from monitored_at after they re-scan.
+          logger.warn(
+            { userId: state.userId, code },
+            'Session logged out — clearing auth for QR; scrape cursor left running'
+          );
           this.clearAuth(state.userId);
-          try {
-            await backend.resetClaimToWaiting(state.userId);
-          } catch (resetErr) {
-            logger.warn(
-              { userId: state.userId, err: resetErr.message },
-              'Failed resetting claim to waiting'
-            );
-          }
           this._setStatus(state, 'disconnected');
           this.sessions.delete(state.userId);
           return;
@@ -872,10 +866,18 @@ class SessionManager {
           ? Date.parse(c.created_at)
           : null;
       const lastScrapedAtMs = c.last_scraped_at ? Date.parse(c.last_scraped_at) : null;
+      const prev = state.monitoredMeta.get(jid);
       state.monitoredMeta.set(jid, {
         name: c.name || chatNameFrom(state.sock, jid, null, state),
         monitoredAtMs: Number.isFinite(monitoredAtMs) ? monitoredAtMs : Date.now(),
-        lastScrapedAtMs: Number.isFinite(lastScrapedAtMs) ? lastScrapedAtMs : null
+        // Keep the earlier cursor if backend pause-stamped last_scraped_at to "now"
+        lastScrapedAtMs: (() => {
+          const incoming = Number.isFinite(lastScrapedAtMs) ? lastScrapedAtMs : null;
+          const existing = prev?.lastScrapedAtMs || null;
+          if (incoming == null) return existing;
+          if (existing == null) return incoming;
+          return Math.min(existing, incoming);
+        })()
       });
     }
 
@@ -1056,13 +1058,14 @@ class SessionManager {
     return null;
   }
 
-  /** Scrape floor: max(monitored_at, last_scraped_at) in Unix seconds. */
+  /**
+   * Scrape floor is the monitor click time only.
+   * last_scraped_at is not used as a cutoff — logout/pause used to stamp it to "now"
+   * and then skip every missed + new message after reconnect. Dedup is by message key.
+   */
   _scrapeFloorSec(meta) {
     if (!meta) return null;
-    let floorMs = meta.monitoredAtMs || 0;
-    if (meta.lastScrapedAtMs && meta.lastScrapedAtMs > floorMs) {
-      floorMs = meta.lastScrapedAtMs;
-    }
+    const floorMs = meta.monitoredAtMs || 0;
     return floorMs ? Math.floor(floorMs / 1000) : null;
   }
 

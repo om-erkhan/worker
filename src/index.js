@@ -83,9 +83,10 @@ async function pollClaimsAndStart() {
       if (uId) activeClaimsMap.set(uId, c);
     }
 
-    // 1) Stop idle un-scanned QR sessions older than 3 minutes or whose claim updated_at is stale
+    // 1) Stop idle un-scanned QR only. Never tear down a linked WhatsApp scrape session.
     for (const s of sessions.list()) {
       if (s.connectedAt || s.status === 'connected') continue;
+      if (sessions.hasAuthCreds(s.userId)) continue;
       if (s.status === 'qr' || s.status === 'reconnecting' || s.status === 'starting') {
         const claim = activeClaimsMap.get(s.userId);
         const claimUpdatedAt = claim?.updated_at ? Date.parse(claim.updated_at) : 0;
@@ -126,7 +127,8 @@ async function pollClaimsAndStart() {
 
       // Permanent fix: never leave waiting users stuck in reconnecting/stale QR
       if (existing && sessions.needsFreshQr(userId)) {
-        const wipeAuth = !(sessions.hasAuthCreds(userId) && claim.status === 'linked');
+        // Linked-device creds must never be wiped — that looks like an automatic logout.
+        const wipeAuth = !sessions.hasAuthCreds(userId);
         logger.warn(
           {
             userId,
@@ -175,15 +177,15 @@ async function pollClaimsAndStart() {
       await sessions.start(userId);
     }
 
-    // Stop non-claimed sessions (except connected ones)
+    // Portal logout: stop QR sockets only. Keep scrape sessions (connected or with creds).
     for (const row of sessions.list()) {
       if (claimedIds.has(row.userId)) continue;
-      if (row.status === 'connected') {
+      if (row.status === 'connected' || row.connectedAt || sessions.hasAuthCreds(row.userId)) {
         continue;
       }
       logger.info(
         { userId: row.userId, status: row.status },
-        'Stopping session without active claim'
+        'Stopping QR session without active claim (scrape left running)'
       );
       await sessions.stop(row.userId);
     }
