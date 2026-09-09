@@ -72,6 +72,24 @@ module.exports = {
     });
   },
 
+  async getLastMessageTimes(userId) {
+    const json = await request('GET', `/api/scraped-chats/messages?userId=${userId}`, {
+      userId,
+      timeoutMs: 40000
+    });
+    const rows = Array.isArray(json?.data) ? json.data : [];
+    const byJid = new Map();
+    for (const row of rows) {
+      const jid = String(row.chat_jid || row.jid || row.chatId || row.chat_id || '').trim();
+      if (!jid) continue;
+      const ts = Date.parse(row.timestamp || row.created_at || '');
+      if (!Number.isFinite(ts)) continue;
+      const prev = byJid.get(jid) || 0;
+      if (ts > prev) byJid.set(jid, ts);
+    }
+    return byJid;
+  },
+
   async getMonitored(userId) {
     const json = await request('GET', `/api/scraped-chats/monitored?userId=${userId}`, {
       userId,

@@ -274,6 +274,7 @@ class SessionManager {
       msgCache: new Map(), // jid -> WAMessage[]
       historyWaiters: new Set(),
       jidAliases: new Map(),
+      lastMessageAtByJid: null, // jid -> last saved message ms (loaded once after connect)
       error: null,
       errorAt: null,
       stopping: false,
@@ -886,6 +887,29 @@ class SessionManager {
     const next = new Set();
     state.monitoredMeta = state.monitoredMeta || new Map();
 
+    if (!state.lastMessageAtByJid) {
+      try {
+        const raw = await backend.getLastMessageTimes(state.userId);
+        state.lastMessageAtByJid = new Map();
+        for (const [jid, ts] of raw.entries()) {
+          const id = toCUs(jid);
+          if (!id || !ts) continue;
+          const prev = state.lastMessageAtByJid.get(id) || 0;
+          if (ts > prev) state.lastMessageAtByJid.set(id, ts);
+        }
+        logger.info(
+          { userId: state.userId, chats: state.lastMessageAtByJid.size },
+          'Loaded last scraped message times for reconnect cursor'
+        );
+      } catch (err) {
+        state.lastMessageAtByJid = new Map();
+        logger.warn(
+          { userId: state.userId, err: err.message },
+          'Failed loading last scraped message times — new chats will use connect time'
+        );
+      }
+    }
+
     for (const c of monitored || []) {
       const jid = toCUs(c.jid || c.id);
       if (!jid) continue;
@@ -895,19 +919,13 @@ class SessionManager {
         : c.created_at
           ? Date.parse(c.created_at)
           : null;
-      const lastScrapedAtMs = c.last_scraped_at ? Date.parse(c.last_scraped_at) : null;
       const prev = state.monitoredMeta.get(jid);
+      const fromDb = state.lastMessageAtByJid.get(jid) || state.lastMessageAtByJid.get(c.jid || '') || null;
+      const lastMessageAtMs = prev?.lastMessageAtMs || fromDb || null;
       state.monitoredMeta.set(jid, {
         name: c.name || chatNameFrom(state.sock, jid, null, state),
         monitoredAtMs: Number.isFinite(monitoredAtMs) ? monitoredAtMs : Date.now(),
-        // Keep the earlier cursor if backend pause-stamped last_scraped_at to "now"
-        lastScrapedAtMs: (() => {
-          const incoming = Number.isFinite(lastScrapedAtMs) ? lastScrapedAtMs : null;
-          const existing = prev?.lastScrapedAtMs || null;
-          if (incoming == null) return existing;
-          if (existing == null) return incoming;
-          return Math.min(existing, incoming);
-        })()
+        lastMessageAtMs: Number.isFinite(lastMessageAtMs) ? lastMessageAtMs : null
       });
     }
 
@@ -1089,14 +1107,14 @@ class SessionManager {
   }
 
   /**
-   * Scrape floor is the monitor click time only.
-   * last_scraped_at is not used as a cutoff — logout/pause used to stamp it to "now"
-   * and then skip every missed + new message after reconnect. Dedup is by message key.
+   * Returning user / reconnect: scrape strictly after the last saved message time.
+   * New user / chat with no saved messages: scrape from WhatsApp connect time.
    */
-  _scrapeFloorSec(meta) {
-    if (!meta) return null;
-    const floorMs = meta.monitoredAtMs || 0;
-    return floorMs ? Math.floor(floorMs / 1000) : null;
+  _scrapeFloorSec(state, meta) {
+    const lastMs = meta?.lastMessageAtMs;
+    if (lastMs) return Math.floor(lastMs / 1000);
+    const connectedMs = state?.connectedAt ? Date.parse(state.connectedAt) : Date.now();
+    return Number.isFinite(connectedMs) ? Math.floor(connectedMs / 1000) : Math.floor(Date.now() / 1000);
   }
 
   async _handleMessages(state, messages) {
@@ -1120,8 +1138,8 @@ class SessionManager {
       const monitoredJid = this._resolveMonitoredJid(state, remoteJid) || remoteJid;
       const epochSec = Number(msg.messageTimestamp || 0);
       const chatMeta = this._getMonitoredMeta(state, monitoredJid);
-      const floorSec = this._scrapeFloorSec(chatMeta);
-      if (floorSec != null && epochSec && epochSec < floorSec) continue;
+      const floorSec = this._scrapeFloorSec(state, chatMeta);
+      if (floorSec != null && epochSec && epochSec <= floorSec) continue;
 
       const msgKey = key.id || `${monitoredJid}_${msg.messageTimestamp}`;
       if (state.seenMsgKeys.has(msgKey)) continue;
@@ -1185,7 +1203,8 @@ class SessionManager {
         const maxEpoch = Math.max(...msgs.map((m) => Number(m.messageEpoch || 0)));
         if (maxEpoch > 0) {
           const ms = maxEpoch * 1000;
-          meta.lastScrapedAtMs = meta.lastScrapedAtMs ? Math.max(meta.lastScrapedAtMs, ms) : ms;
+          meta.lastMessageAtMs = meta.lastMessageAtMs ? Math.max(meta.lastMessageAtMs, ms) : ms;
+          if (state.lastMessageAtByJid) state.lastMessageAtByJid.set(chatId, meta.lastMessageAtMs);
         }
       }
       logger.info(
