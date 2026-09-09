@@ -981,7 +981,7 @@ class SessionManager {
 
       let oldest = this._oldestCached(state, jid);
       if (!oldest?.key?.id) {
-        for (let i = 0; i < 5 && !oldest?.key?.id; i++) {
+        for (let i = 0; i < 15 && !oldest?.key?.id; i++) {
           await sleep(2000);
           oldest = this._oldestCached(state, jid);
         }
@@ -990,9 +990,8 @@ class SessionManager {
       if (!oldest?.key?.id) {
         logger.warn(
           { userId: state.userId, jid },
-          'No seed message yet for catch-up — live scrape will continue'
+          'No seed message yet for catch-up — will retry on next monitor poll'
         );
-        state.historySyncedJids.add(jid);
         return;
       }
 
