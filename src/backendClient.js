@@ -78,14 +78,29 @@ module.exports = {
       timeoutMs: 40000
     });
     const rows = Array.isArray(json?.data) ? json.data : [];
-    const byJid = new Map();
+    const timesByJid = new Map();
     for (const row of rows) {
       const jid = String(row.chat_jid || row.jid || row.chatId || row.chat_id || '').trim();
       if (!jid) continue;
       const ts = Date.parse(row.timestamp || row.created_at || '');
       if (!Number.isFinite(ts)) continue;
-      const prev = byJid.get(jid) || 0;
-      if (ts > prev) byJid.set(jid, ts);
+      if (!timesByJid.has(jid)) timesByJid.set(jid, []);
+      timesByJid.get(jid).push(ts);
+    }
+
+    // Resume after the last message before a long outage hole (e.g. 7 Sep → 9 Sep).
+    const HOLE_MS = 6 * 60 * 60 * 1000;
+    const byJid = new Map();
+    for (const [jid, times] of timesByJid.entries()) {
+      times.sort((a, b) => a - b);
+      let cursor = times[times.length - 1];
+      for (let i = times.length - 1; i > 0; i--) {
+        if (times[i] - times[i - 1] > HOLE_MS) {
+          cursor = times[i - 1];
+          break;
+        }
+      }
+      byJid.set(jid, cursor);
     }
     return byJid;
   },

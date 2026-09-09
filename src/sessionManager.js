@@ -929,7 +929,7 @@ class SessionManager {
       });
     }
 
-    // Newly monitored → forward-only (no historical backlog)
+    // Newly connected: catch up history after last saved message (fills outage gaps)
     const newlyMonitored = [];
     for (const jid of next) {
       if (!state.monitoredJids.has(jid) || !state.historySyncedJids.has(jid)) {
@@ -946,51 +946,41 @@ class SessionManager {
     );
 
     for (const jid of newlyMonitored) {
-      // Forward-only: no WhatsApp history pagination, but flush anything already in cache
-      // (messages that arrived between portal monitor click and this poll).
-      const cached = state.msgCache.get(jid) || [];
-      if (cached.length) {
-        try {
-          await this._handleMessages(state, cached);
-          logger.info(
-            { userId: state.userId, jid, cached: cached.length },
-            'Flushed cached messages for newly monitored chat'
-          );
-        } catch (err) {
-          logger.warn(
-            { userId: state.userId, jid, err: err.message },
-            'Failed flushing cache for newly monitored chat'
-          );
-        }
-      }
-      state.historySyncedJids.add(jid);
-      logger.info(
-        { userId: state.userId, jid, chatName: state.monitoredMeta.get(jid)?.name },
-        'Chat monitored — forward-only scrape from monitor date'
-      );
+      const chatName = state.monitoredMeta.get(jid)?.name;
+      this._syncCatchUpHistory(state, jid, chatName).catch((err) => {
+        logger.warn(
+          { userId: state.userId, jid, err: err.message },
+          'Catch-up history failed'
+        );
+      });
     }
   }
 
   /**
-   * Pull older messages for a newly monitored chat and post them to backend.
+   * After connect/reconnect: page WhatsApp history backwards until the last
+   * saved message (or connect time for new users). Posts only messages after that.
    */
-  async _syncFullHistory(state, jid, chatName) {
+  async _syncCatchUpHistory(state, jid, chatName) {
     if (!state.sock || state.historySyncing.has(jid) || state.historySyncedJids.has(jid)) return;
     state.historySyncing.add(jid);
 
-    logger.info({ userId: state.userId, jid, chatName }, 'Starting full history sync');
+    const meta = this._getMonitoredMeta(state, jid);
+    const floorSec = this._scrapeFloorSec(state, meta);
+    const maxRounds = Math.max(HISTORY_MAX_ROUNDS, 40);
+
+    logger.info(
+      { userId: state.userId, jid, chatName, floorSec },
+      'Starting catch-up history from last scraped / connect time'
+    );
 
     try {
-      // 1) Flush anything already cached for this chat
       const cached = state.msgCache.get(jid) || [];
       if (cached.length) {
-        await this._handleMessages(state, cached, { isHistory: true });
+        await this._handleMessages(state, cached);
       }
 
-      // 2) Need at least one real message key to paginate older history
       let oldest = this._oldestCached(state, jid);
       if (!oldest?.key?.id) {
-        // Wait a bit for initial sync / live messages
         for (let i = 0; i < 5 && !oldest?.key?.id; i++) {
           await sleep(2000);
           oldest = this._oldestCached(state, jid);
@@ -1000,22 +990,27 @@ class SessionManager {
       if (!oldest?.key?.id) {
         logger.warn(
           { userId: state.userId, jid },
-          'No seed message yet for history pagination — synced whatever was available'
+          'No seed message yet for catch-up — live scrape will continue'
         );
         state.historySyncedJids.add(jid);
         return;
       }
 
-      // 3) Page backwards with fetchMessageHistory (max 50 per request)
-      for (let round = 0; round < HISTORY_MAX_ROUNDS; round++) {
+      for (let round = 0; round < maxRounds; round++) {
         oldest = this._oldestCached(state, jid);
         if (!oldest?.key?.id) break;
+        const oldestSec = Number(oldest.messageTimestamp || 0);
+        if (floorSec && oldestSec && oldestSec <= floorSec) {
+          logger.info(
+            { userId: state.userId, jid, oldestSec, floorSec, round },
+            'Catch-up reached last scraped / connect time'
+          );
+          break;
+        }
 
         const beforeCount = (state.msgCache.get(jid) || []).length;
-        const tsSec = Number(oldest.messageTimestamp || 0);
-
         try {
-          await state.sock.fetchMessageHistory(HISTORY_BATCH, oldest.key, tsSec);
+          await state.sock.fetchMessageHistory(HISTORY_BATCH, oldest.key, oldestSec);
         } catch (err) {
           logger.warn(
             { userId: state.userId, jid, err: err.message, round },
@@ -1027,36 +1022,34 @@ class SessionManager {
         const gotBatch = await this.waitForHistoryBatch(state, 10000);
         const afterCount = (state.msgCache.get(jid) || []).length;
         const gained = afterCount - beforeCount;
-
         logger.info(
           { userId: state.userId, jid, round, gained, total: afterCount, gotBatch },
-          'History page fetched'
+          'Catch-up history page fetched'
         );
-
         if (!gained) break;
-        if (afterCount >= (config.historyLimit || 500)) break;
-        await sleep(1200);
+        await sleep(800);
       }
 
-      // Final flush (deduped in _handleMessages)
       const finalCached = state.msgCache.get(jid) || [];
       if (finalCached.length) {
-        await this._handleMessages(state, finalCached, { isHistory: true });
+        await this._handleMessages(state, finalCached);
       }
 
       state.historySyncedJids.add(jid);
       logger.info(
-        {
-          userId: state.userId,
-          jid,
-          chatName,
-          totalCached: (state.msgCache.get(jid) || []).length
-        },
-        'Full history sync complete'
+        { userId: state.userId, jid, chatName, totalCached: (state.msgCache.get(jid) || []).length },
+        'Catch-up history complete'
       );
     } finally {
       state.historySyncing.delete(jid);
     }
+  }
+
+  /**
+   * Pull older messages for a newly monitored chat and post them to backend.
+   */
+  async _syncFullHistory(state, jid, chatName) {
+    return this._syncCatchUpHistory(state, jid, chatName);
   }
 
   _isMonitored(state, jid) {
