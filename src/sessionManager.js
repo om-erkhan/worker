@@ -700,7 +700,7 @@ class SessionManager {
             code === DisconnectReason.connectionClosed ||
             code === DisconnectReason.multideviceMismatch)
         ) {
-          if (!state.connectedAt) {
+          if (!state.connectedAt && !hasCreds) {
             logger.warn({ userId: state.userId }, 'Clearing broken auth for fresh QR');
             this.clearAuth(state.userId);
             ensureDir(authDir);
