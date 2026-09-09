@@ -172,6 +172,11 @@ async function pollClaimsAndStart() {
       }
       if (claim.status === 'linked' && !sessions.hasAuthCreds(userId)) {
         logger.info({ userId }, 'Linked claim has no auth — starting fresh QR session');
+        try {
+          await backend.resetClaimToWaiting(userId);
+        } catch (err) {
+          logger.warn({ userId, err: err.message }, 'Failed setting claim to waiting for QR');
+        }
       }
       logger.info({ userId, status: claim.status }, 'Auto-starting session from claim');
       await sessions.start(userId);

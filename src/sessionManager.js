@@ -234,8 +234,8 @@ class SessionManager {
     await this.stop(id, { logout: false });
     if (wipeAuth) {
       this.clearAuth(id);
-      // Do not reset the claim / pause scraping — portal logout and QR refresh
-      // must not mark the user disconnected or freeze chat ingest.
+      // Show QR on the portal. Do not pause scraping.
+      await this._markPortalNeedsQr(id);
     }
     return this.start(id);
   }
@@ -340,6 +340,22 @@ class SessionManager {
       return fs.existsSync(path.join(authDir, 'creds.json'));
     } catch (_) {
       return false;
+    }
+  }
+
+  /**
+   * Portal "connected" comes from claim status=linked, not the live socket.
+   * When there is no WhatsApp session, put the claim back to waiting so the
+   * UI shows QR instead of a stale connected state. Never pause scraping.
+   */
+  async _markPortalNeedsQr(userId) {
+    const id = Number(userId);
+    if (!id) return;
+    try {
+      await backend.resetClaimToWaiting(id);
+      logger.info({ userId: id }, 'Portal claim set to waiting — not actually connected');
+    } catch (err) {
+      logger.warn({ userId: id, err: err.message }, 'Failed setting claim to waiting');
     }
   }
 
@@ -507,6 +523,11 @@ class SessionManager {
         this._setStatus(state, 'qr');
         state.reconnectAttempts = 0;
         state.lastQrAt = new Date().toISOString();
+        // QR on screen means WhatsApp is not linked — don't leave portal as connected.
+        if (!state.connectedAt && !state.portalWaitingForQr) {
+          state.portalWaitingForQr = true;
+          await this._markPortalNeedsQr(state.userId);
+        }
         try {
           await backend.postQr(state.userId, qr);
           state.lastQrDataUrl = await QRCode.toDataURL(qr);
@@ -520,6 +541,7 @@ class SessionManager {
         this._setStatus(state, 'connected');
         state.reconnectAttempts = 0;
         state.connectedAt = new Date().toISOString();
+        state.portalWaitingForQr = false;
         state.error = null;
         const waJid = toCUs(sock.user?.id || sock.user?.lid || '');
         state.waJid = waJid || null;
@@ -616,13 +638,13 @@ class SessionManager {
         );
 
         if (!shouldReconnect) {
-          // WhatsApp logged out: drop the socket/QR only. Keep claim linked and do
-          // not pause scraping so ingest resumes from monitored_at after they re-scan.
+          // Drop the socket and show QR. Do not pause scraping.
           logger.warn(
             { userId: state.userId, code },
             'Session logged out — clearing auth for QR; scrape cursor left running'
           );
           this.clearAuth(state.userId);
+          await this._markPortalNeedsQr(state.userId);
           this._setStatus(state, 'disconnected');
           this.sessions.delete(state.userId);
           return;
@@ -643,6 +665,7 @@ class SessionManager {
             'Never-linked session disconnect — clearing auth for fresh QR'
           );
           this.clearAuth(state.userId);
+          await this._markPortalNeedsQr(state.userId);
           ensureDir(authDir);
           state.reconnectAttempts = 0;
         }
