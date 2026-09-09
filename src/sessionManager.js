@@ -275,6 +275,7 @@ class SessionManager {
       historyWaiters: new Set(),
       jidAliases: new Map(),
       lastMessageAtByJid: null, // jid -> last saved message ms (loaded once after connect)
+      catchUpFloorByJid: null, // frozen reconnect cursor; not raised by live posts
       error: null,
       errorAt: null,
       stopping: false,
@@ -928,8 +929,10 @@ class SessionManager {
           { userId: state.userId, chats: state.lastMessageAtByJid.size },
           'Loaded last scraped message times for reconnect cursor'
         );
+        state.catchUpFloorByJid = new Map(state.lastMessageAtByJid);
       } catch (err) {
         state.lastMessageAtByJid = new Map();
+        state.catchUpFloorByJid = new Map();
         logger.warn(
           { userId: state.userId, err: err.message },
           'Failed loading last scraped message times — new chats will use connect time'
@@ -948,11 +951,16 @@ class SessionManager {
           : null;
       const prev = state.monitoredMeta.get(jid);
       const fromDb = state.lastMessageAtByJid.get(jid) || state.lastMessageAtByJid.get(c.jid || '') || null;
-      const lastMessageAtMs = prev?.lastMessageAtMs || fromDb || null;
+      const catchUpFloorMs =
+        prev?.catchUpFloorMs ||
+        state.catchUpFloorByJid?.get(jid) ||
+        fromDb ||
+        null;
       state.monitoredMeta.set(jid, {
         name: c.name || chatNameFrom(state.sock, jid, null, state),
         monitoredAtMs: Number.isFinite(monitoredAtMs) ? monitoredAtMs : Date.now(),
-        lastMessageAtMs: Number.isFinite(lastMessageAtMs) ? lastMessageAtMs : null
+        lastMessageAtMs: Number.isFinite(prev?.lastMessageAtMs) ? prev.lastMessageAtMs : fromDb,
+        catchUpFloorMs: Number.isFinite(catchUpFloorMs) ? catchUpFloorMs : null
       });
     }
 
@@ -1035,8 +1043,12 @@ class SessionManager {
         }
 
         const beforeCount = this._cachedList(state, jid).length;
+        const histKey = {
+          ...(oldest.key || {}),
+          remoteJid: oldest.key?.remoteJid || jid
+        };
         try {
-          await state.sock.fetchMessageHistory(HISTORY_BATCH, oldest.key, oldestSec);
+          await state.sock.fetchMessageHistory(HISTORY_BATCH, histKey, oldestSec);
         } catch (err) {
           logger.warn(
             { userId: state.userId, jid, err: err.message, round },
@@ -1147,12 +1159,12 @@ class SessionManager {
   }
 
   /**
-   * Returning user / reconnect: scrape strictly after the last saved message time.
-   * New user / chat with no saved messages: scrape from WhatsApp connect time.
+   * Ingest floor stays at the reconnect cursor (last saved before an outage hole).
+   * Live posts must not raise this, or catch-up thinks the gap is already filled.
    */
   _scrapeFloorSec(state, meta) {
-    const lastMs = meta?.lastMessageAtMs;
-    if (lastMs) return Math.floor(lastMs / 1000);
+    const floorMs = meta?.catchUpFloorMs || meta?.lastMessageAtMs;
+    if (floorMs) return Math.floor(floorMs / 1000);
     const connectedMs = state?.connectedAt ? Date.parse(state.connectedAt) : Date.now();
     return Number.isFinite(connectedMs) ? Math.floor(connectedMs / 1000) : Math.floor(Date.now() / 1000);
   }
@@ -1244,7 +1256,6 @@ class SessionManager {
         if (maxEpoch > 0) {
           const ms = maxEpoch * 1000;
           meta.lastMessageAtMs = meta.lastMessageAtMs ? Math.max(meta.lastMessageAtMs, ms) : ms;
-          if (state.lastMessageAtByJid) state.lastMessageAtByJid.set(chatId, meta.lastMessageAtMs);
         }
       }
       logger.info(
