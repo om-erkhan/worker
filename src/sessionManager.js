@@ -523,8 +523,9 @@ class SessionManager {
         this._setStatus(state, 'qr');
         state.reconnectAttempts = 0;
         state.lastQrAt = new Date().toISOString();
-        // QR on screen means WhatsApp is not linked — don't leave portal as connected.
-        if (!state.connectedAt && !state.portalWaitingForQr) {
+        // Only flip portal off "connected" when there is no saved WhatsApp session.
+        // Restores with creds.json must not look like a logout while reconnecting.
+        if (!this.hasAuthCreds(state.userId) && !state.portalWaitingForQr) {
           state.portalWaitingForQr = true;
           await this._markPortalNeedsQr(state.userId);
         }
@@ -625,7 +626,7 @@ class SessionManager {
         const code = err?.output?.statusCode;
         const errMsg = err?.message || String(err || '');
         const loggedOut = code === DisconnectReason.loggedOut;
-        const shouldReconnect = !loggedOut && !state.stopping;
+        const isActive = this.sessions.get(state.userId) === state;
 
         if (state.monitoredTimer) {
           clearInterval(state.monitoredTimer);
@@ -633,15 +634,20 @@ class SessionManager {
         }
 
         logger.warn(
-          { userId: state.userId, code, errMsg, attempts: state.reconnectAttempts },
+          { userId: state.userId, code, errMsg, attempts: state.reconnectAttempts, stopping: state.stopping, isActive },
           'WhatsApp disconnected'
         );
 
+        // stop()/restart already replaced this socket — never wipe the new session
+        if (state.stopping || !isActive) {
+          return;
+        }
+
+        const shouldReconnect = !loggedOut;
         if (!shouldReconnect) {
-          // Drop the socket and show QR. Do not pause scraping.
           logger.warn(
             { userId: state.userId, code },
-            'Session logged out — clearing auth for QR; scrape cursor left running'
+            'WhatsApp logged out on the phone — new QR needed; scrape cursor left running'
           );
           this.clearAuth(state.userId);
           await this._markPortalNeedsQr(state.userId);
@@ -652,8 +658,9 @@ class SessionManager {
 
         state.reconnectAttempts = (state.reconnectAttempts || 0) + 1;
 
-        // QR expired / never linked: clear half-auth and refresh QR quickly
-        const neverLinked = !state.connectedAt;
+        // 408 is also connectionLost — do not treat it as "never linked" if creds exist
+        const hasCreds = this.hasAuthCreds(state.userId);
+        const neverLinked = !state.connectedAt && !hasCreds;
         const qrExpired =
           code === 408 ||
           /QR refs attempts ended/i.test(errMsg) ||
@@ -662,7 +669,7 @@ class SessionManager {
         if (neverLinked && (qrExpired || state.reconnectAttempts >= 2)) {
           logger.warn(
             { userId: state.userId, code, attempts: state.reconnectAttempts },
-            'Never-linked session disconnect — clearing auth for fresh QR'
+            'Never-linked session disconnect — clearing half-auth for fresh QR'
           );
           this.clearAuth(state.userId);
           await this._markPortalNeedsQr(state.userId);
